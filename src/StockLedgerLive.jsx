@@ -59,7 +59,10 @@ async function askClaude(content) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content }),
   });
-  if (!res.ok) throw new Error("AI request failed");
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error("AI request failed: " + errBody);
+  }
   const data = await res.json();
   if (data.error) throw new Error(data.error);
   const text = data.content.find((b) => b.type === "text")?.text || "{}";
