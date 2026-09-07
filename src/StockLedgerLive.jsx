@@ -88,6 +88,14 @@ export default function StockLedgerLive() {
   const [showContacts, setShowContacts] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [newContactName, setNewContactName] = useState("");
+  const [contactCaptureStep, setContactCaptureStep] = useState("idle"); // idle, photo-loading, listening, thinking, review
+  const [contactDraft, setContactDraft] = useState({ name: "", phone: "", location: "" });
+  const [contactPhotoPreview, setContactPhotoPreview] = useState(null);
+  const [similarContacts, setSimilarContacts] = useState([]);
+  const [contactCaptureError, setContactCaptureError] = useState("");
+  const contactFileInputRef = useRef(null);
+  const contactRecorderRef = useRef(null);
+  const contactChunksRef = useRef([]);
   const [newContactPhone, setNewContactPhone] = useState("");
   const [importStatus, setImportStatus] = useState("");
   const [saleStep, setSaleStep] = useState("idle"); // idle, listening, matching, confirm
@@ -308,6 +316,109 @@ export default function StockLedgerLive() {
     setSaleMatch((prev) => ({ ...prev, listing: null }));
   };
 
+  // --- Simple fuzzy name matching: exact, or one name contains the other, or shared first name ---
+  const findSimilarContacts = (name) => {
+    if (!name || !name.trim()) return [];
+    const target = name.trim().toLowerCase();
+    const targetFirst = target.split(" ")[0];
+    return contacts.filter((c) => {
+      const existing = c.name.toLowerCase();
+      if (existing === target) return true;
+      if (existing.includes(target) || target.includes(existing)) return true;
+      if (existing.split(" ")[0] === targetFirst) return true;
+      return false;
+    });
+  };
+
+  const handleContactPhoto = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setContactCaptureError("");
+    setContactCaptureStep("photo-loading");
+    try {
+      const base64 = await fileToBase64(file);
+      setContactPhotoPreview(`data:${file.type};base64,${base64}`);
+      const result = await askClaude([
+        { type: "image", source: { type: "base64", media_type: file.type, data: base64 } },
+        { type: "text", text: 'This is a screenshot of a phone contact card or chat (e.g. WhatsApp, Contacts app). Read the person\'s name and phone number. Respond ONLY with raw JSON: {"name": "", "phone": ""}. Empty string for anything not clearly visible.' },
+      ]);
+      const draft = { name: result.name || "", phone: result.phone || "", location: "" };
+      setContactDraft(draft);
+      setSimilarContacts(findSimilarContacts(draft.name));
+      setContactCaptureStep("review");
+    } catch (err) {
+      setContactCaptureError("Couldn't read that photo clearly — fill in the name manually below.");
+      setContactCaptureStep("review");
+    }
+  };
+
+  const startContactVoice = async () => {
+    setContactCaptureError("");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      contactChunksRef.current = [];
+      recorder.ondataavailable = (e) => contactChunksRef.current.push(e.data);
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        setContactCaptureStep("thinking");
+        try {
+          const audioBlob = new Blob(contactChunksRef.current, { type: "audio/webm" });
+          const formData = new FormData();
+          formData.append("audio", audioBlob, "recording.webm");
+          const res = await fetch("/api/transcribe", { method: "POST", body: formData });
+          const data = await res.json();
+          if (!res.ok || data.error) throw new Error(data.error || "Transcription failed");
+          setContactDraft((prev) => ({ ...prev, location: data.transcript }));
+          setContactCaptureStep("review");
+        } catch (err) {
+          setContactCaptureError("Couldn't transcribe that (" + err.message + ") — type the location manually below.");
+          setContactCaptureStep("review");
+        }
+      };
+      contactRecorderRef.current = recorder;
+      recorder.start();
+      setContactCaptureStep("listening");
+    } catch (err) {
+      setContactCaptureError("Couldn't access the microphone.");
+    }
+  };
+  const stopContactVoice = () => contactRecorderRef.current?.stop();
+
+  const resetContactCapture = () => {
+    setContactCaptureStep("idle");
+    setContactDraft({ name: "", phone: "", location: "" });
+    setContactPhotoPreview(null);
+    setSimilarContacts([]);
+    setContactCaptureError("");
+  };
+
+  const saveNewContact = async () => {
+    if (!contactDraft.name.trim()) return;
+    const created = await createContact({
+      dealer_id: DEALER_ID,
+      name: contactDraft.name.trim(),
+      phone: contactDraft.phone || null,
+      notes: contactDraft.location || null,
+    });
+    if (created?.[0]) setContacts((prev) => [...prev, created[0]].sort((a, b) => a.name.localeCompare(b.name)));
+    resetContactCapture();
+  };
+
+  const useExistingContact = async (existing) => {
+    // Optionally enrich the existing contact with newly captured phone/location if it was missing either
+    const updates = {};
+    if (!existing.phone && contactDraft.phone) updates.phone = contactDraft.phone;
+    if (contactDraft.location) updates.notes = existing.notes ? `${existing.notes}; ${contactDraft.location}` : contactDraft.location;
+    if (Object.keys(updates).length > 0) {
+      try {
+        await sbFetch(`contacts?id=eq.${existing.id}`, { method: "PATCH", body: JSON.stringify(updates) });
+        setContacts((prev) => prev.map((c) => (c.id === existing.id ? { ...c, ...updates } : c)));
+      } catch (err) { /* non-fatal */ }
+    }
+    resetContactCapture();
+  };
+
   const saveDraft = async () => {
     if (!draft.model) return;
     setSaving(true);
@@ -389,20 +500,67 @@ export default function StockLedgerLive() {
       {showContacts && (
         <div className="border-2 rounded-sm p-4 mb-6" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
           <p className="text-xs uppercase tracking-wide mb-3" style={{ color: "#6B6555" }}>Contacts (buyers & suppliers)</p>
-          <div className="flex flex-col sm:flex-row gap-2 mb-3">
-            <input placeholder="Name" value={newContactName} onChange={(e) => setNewContactName(e.target.value)} className="border px-2.5 py-2 text-sm rounded-sm flex-1" style={{ borderColor: "#D8D2C2" }} />
-            <input placeholder="Phone (optional)" value={newContactPhone} onChange={(e) => setNewContactPhone(e.target.value)} className="border px-2.5 py-2 text-sm rounded-sm flex-1" style={{ borderColor: "#D8D2C2" }} />
-            <button
-              onClick={async () => {
-                if (!newContactName.trim()) return;
-                const created = await createContact({ dealer_id: DEALER_ID, name: newContactName.trim(), phone: newContactPhone || null });
-                if (created?.[0]) setContacts((prev) => [...prev, created[0]].sort((a, b) => a.name.localeCompare(b.name)));
-                setNewContactName(""); setNewContactPhone("");
-              }}
-              className="text-sm font-medium px-4 py-2 rounded-sm text-white" style={{ background: "#3A5A5E" }}
-            >Add</button>
-          </div>
-          <p className="text-xs mb-2" style={{ color: "#8A8272" }}>Import from a CSV with columns: name, phone (one per line, header row optional)</p>
+
+          {contactCaptureStep === "idle" && (
+            <div className="flex flex-col sm:flex-row gap-2 mb-3">
+              <button onClick={() => contactFileInputRef.current?.click()} className="flex items-center justify-center gap-1.5 text-xs font-medium px-3 py-2 rounded-sm text-white" style={{ background: "#1C1B19" }}>
+                <Camera size={13} /> Screenshot their name & number
+              </button>
+              <input ref={contactFileInputRef} type="file" accept="image/*" onChange={handleContactPhoto} className="hidden" />
+              <button onClick={startContactVoice} className="flex items-center justify-center gap-1.5 text-xs font-medium px-3 py-2 rounded-sm text-white" style={{ background: "#3A5A5E" }}>
+                <Mic size={13} /> Voice note their location
+              </button>
+            </div>
+          )}
+
+          {contactCaptureStep === "photo-loading" && (
+            <div className="flex items-center gap-3 mb-3">
+              {contactPhotoPreview && <img src={contactPhotoPreview} alt="" className="w-14 h-14 object-cover rounded-sm border" style={{ borderColor: "#D8D2C2" }} />}
+              <p className="text-xs flex items-center gap-1.5" style={{ color: "#6B6555" }}><Loader2 size={12} className="animate-spin" /> Reading name & number…</p>
+            </div>
+          )}
+
+          {contactCaptureStep === "listening" && (
+            <div className="mb-3 flex items-center gap-3">
+              <p className="text-xs animate-pulse" style={{ color: "#A8452F" }}>Listening for location…</p>
+              <button onClick={stopContactVoice} className="text-xs font-medium px-3 py-1.5 rounded-sm text-white" style={{ background: "#A8452F" }}>Stop</button>
+            </div>
+          )}
+
+          {contactCaptureStep === "thinking" && (
+            <p className="text-xs mb-3 flex items-center gap-1.5" style={{ color: "#6B6555" }}><Loader2 size={12} className="animate-spin" /> Transcribing…</p>
+          )}
+
+          {contactCaptureStep === "review" && (
+            <div className="border rounded-sm p-3 mb-3" style={{ borderColor: "#D8D2C2" }}>
+              {contactCaptureError && <p className="text-xs mb-2" style={{ color: "#A8452F" }}>{contactCaptureError}</p>}
+
+              {similarContacts.length > 0 && (
+                <div className="mb-3 pb-3 border-b" style={{ borderColor: "#EFEAE0" }}>
+                  <p className="text-xs mb-2" style={{ color: "#6B6555" }}>Similar contact{similarContacts.length > 1 ? "s" : ""} already saved — is this the same person?</p>
+                  {similarContacts.map((c) => (
+                    <div key={c.id} className="flex items-center justify-between text-xs py-1">
+                      <span>{c.name}{c.phone ? ` · ${c.phone}` : ""}</span>
+                      <button onClick={() => useExistingContact(c)} className="px-2.5 py-1 rounded-sm text-white text-xs" style={{ background: "#3A5A5E" }}>Use this one</button>
+                    </div>
+                  ))}
+                  <p className="text-xs mt-2" style={{ color: "#8A8272" }}>Or fill in below to save as a new, separate contact.</p>
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-2.5 mb-2">
+                <input placeholder="Name" value={contactDraft.name} onChange={(e) => { const v = e.target.value; setContactDraft({ ...contactDraft, name: v }); setSimilarContacts(findSimilarContacts(v)); }} className="border px-2.5 py-2 text-sm rounded-sm col-span-2" style={{ borderColor: "#D8D2C2" }} />
+                <input placeholder="Phone" value={contactDraft.phone} onChange={(e) => setContactDraft({ ...contactDraft, phone: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm col-span-2" style={{ borderColor: "#D8D2C2" }} />
+                <input placeholder="Location / notes" value={contactDraft.location} onChange={(e) => setContactDraft({ ...contactDraft, location: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm col-span-2" style={{ borderColor: "#D8D2C2" }} />
+              </div>
+              <div className="flex gap-2">
+                <button onClick={saveNewContact} className="text-sm font-medium px-4 py-2 rounded-sm text-white" style={{ background: "#3A5A5E" }}>Save as new contact</button>
+                <button onClick={resetContactCapture} className="text-xs px-3 py-2" style={{ color: "#8A8272" }}>Cancel</button>
+              </div>
+            </div>
+          )}
+
+          <p className="text-xs mt-3 mb-2 pt-3 border-t" style={{ color: "#8A8272", borderColor: "#EFEAE0" }}>Or import from a CSV with columns: name, phone (header row optional)</p>
           <input
             type="file"
             accept=".csv"
