@@ -22,7 +22,7 @@ const EXPENSE_CATEGORIES = [
   { key: "sundry", label: "Sundry / Other" },
 ];
 
-const blankDraft = { model: "", storage: "", color: "", cost_price: "", price: "", warranty_months: "", bought_from: "", imei_full: "", condition_score: "", expenses: {} };
+const blankDraft = { model: "", storage: "", color: "", cost_price: "", price: "", warranty_months: "", bought_from: "", sold_to: "", imei_full: "", condition_score: "", expenses: {} };
 
 // --- Supabase REST helpers (direct fetch, no client library needed) ---
 async function sbFetch(path, options = {}) {
@@ -47,6 +47,8 @@ async function sbFetch(path, options = {}) {
 const getListings = () => sbFetch("listings?is_archived=eq.false&select=*,expenses(category,amount)&order=created_at.desc");
 const createListing = (data) => sbFetch("listings", { method: "POST", body: JSON.stringify(data) });
 const createExpense = (data) => sbFetch("expenses", { method: "POST", body: JSON.stringify(data) });
+const getContacts = () => sbFetch("contacts?order=name.asc");
+const createContact = (data) => sbFetch("contacts", { method: "POST", body: JSON.stringify(data) });
 const updateListingStatus = (id, status) =>
   sbFetch(`listings?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status, updated_at: new Date().toISOString() }) });
 const archiveListing = (id) =>
@@ -80,6 +82,12 @@ function fileToBase64(file) {
 
 export default function StockLedgerLive() {
   const [items, setItems] = useState([]);
+  const [contacts, setContacts] = useState([]);
+  const [showContacts, setShowContacts] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const [newContactName, setNewContactName] = useState("");
+  const [newContactPhone, setNewContactPhone] = useState("");
+  const [importStatus, setImportStatus] = useState("");
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [filter, setFilter] = useState("all");
@@ -111,14 +119,29 @@ export default function StockLedgerLive() {
 
   useEffect(() => {
     refresh();
+    getContacts().then(setContacts).catch(() => {});
   }, []);
+
+  // Ensures a "bought from" / "sold to" name exists as a contact, creating it if new.
+  // Returns silently on failure so contact-linking never blocks a save.
+  const ensureContact = async (name) => {
+    if (!name || !name.trim()) return;
+    const trimmed = name.trim();
+    if (contacts.some((c) => c.name.toLowerCase() === trimmed.toLowerCase())) return;
+    try {
+      const created = await createContact({ dealer_id: DEALER_ID, name: trimmed });
+      if (created?.[0]) setContacts((prev) => [...prev, created[0]].sort((a, b) => a.name.localeCompare(b.name)));
+    } catch (err) {
+      // non-fatal — contact linking is a convenience, not a requirement
+    }
+  };
 
   const parseNote = async (transcript) => {
     setVoiceTranscript(transcript);
     setVoiceStatus("thinking");
     try {
       const result = await askClaude([
-        { type: "text", text: `A phone dealer said this out loud while logging stock: "${transcript}". Extract whatever's mentioned into JSON. Respond ONLY with raw JSON, no markdown, no other text before or after, in this exact shape: {"model": "", "storage": "", "color": "", "cost_price": "", "price": "", "bought_from": "", "condition_score": "", "warranty_months": "", "expenses": {"shipping": "", "repairs": "", "accessories": "", "labour": "", "petrol": "", "sundry": ""}}. All price/cost/expense values should be plain numbers only (no "R", no commas, no currency words), as strings. Leave anything not mentioned as an empty string. If the speaker corrects themselves mid-sentence (e.g. says one value then says "no wait" or "not X, Y"), use their corrected/final value, not the first one they said.` },
+        { type: "text", text: `A phone dealer said this out loud while logging stock: "${transcript}". Extract whatever's mentioned into JSON. Respond ONLY with raw JSON, no markdown, no other text before or after, in this exact shape: {"model": "", "storage": "", "color": "", "cost_price": "", "price": "", "bought_from": "", "sold_to": "", "condition_score": "", "warranty_months": "", "expenses": {"shipping": "", "repairs": "", "accessories": "", "labour": "", "petrol": "", "sundry": ""}}. All price/cost/expense values should be plain numbers only (no "R", no commas, no currency words), as strings. Leave anything not mentioned as an empty string. If the speaker corrects themselves mid-sentence (e.g. says one value then says "no wait" or "not X, Y"), use their corrected/final value, not the first one they said.` },
       ]);
       const { expenses: parsedExpenses, ...phoneFields } = result;
       setDraft((d) => ({
@@ -208,12 +231,14 @@ export default function StockLedgerLive() {
         cost_price: draft.cost_price ? Number(draft.cost_price) : null,
         price: Number(draft.price) || 0,
         bought_from: draft.bought_from || null,
+        sold_to: draft.sold_to || null,
         imei_full: draft.imei_full || null,
         condition_score: draft.condition_score ? Number(draft.condition_score) : null,
         warranty_months: draft.warranty_months ? Number(draft.warranty_months) : null,
         stock_type: "pre_owned",
         status: "available",
       });
+      await Promise.all([ensureContact(draft.bought_from), ensureContact(draft.sold_to)]);
       const newListingId = created?.[0]?.id;
       const expenseEntries = Object.entries(draft.expenses || {}).filter(([, v]) => v && Number(v) > 0);
       if (newListingId && expenseEntries.length > 0) {
@@ -265,7 +290,107 @@ export default function StockLedgerLive() {
           <h1 style={{ fontFamily: "'Roboto Slab', serif", letterSpacing: "-0.01em" }} className="text-2xl md:text-3xl font-bold">Stock Ledger</h1>
           <p className="text-sm mt-1" style={{ color: "#6B6555" }}>Connected to CertiFone live database</p>
         </div>
+        <div className="flex gap-2">
+          <button onClick={() => setShowContacts(!showContacts)} className="text-xs font-medium px-3 py-2 rounded-sm border" style={{ borderColor: "#D8D2C2", color: "#6B6555" }}>Contacts ({contacts.length})</button>
+          <button onClick={() => setShowImport(!showImport)} className="text-xs font-medium px-3 py-2 rounded-sm border" style={{ borderColor: "#D8D2C2", color: "#6B6555" }}>Import CSV</button>
+        </div>
       </div>
+
+      {showContacts && (
+        <div className="border-2 rounded-sm p-4 mb-6" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
+          <p className="text-xs uppercase tracking-wide mb-3" style={{ color: "#6B6555" }}>Contacts (buyers & suppliers)</p>
+          <div className="flex flex-col sm:flex-row gap-2 mb-3">
+            <input placeholder="Name" value={newContactName} onChange={(e) => setNewContactName(e.target.value)} className="border px-2.5 py-2 text-sm rounded-sm flex-1" style={{ borderColor: "#D8D2C2" }} />
+            <input placeholder="Phone (optional)" value={newContactPhone} onChange={(e) => setNewContactPhone(e.target.value)} className="border px-2.5 py-2 text-sm rounded-sm flex-1" style={{ borderColor: "#D8D2C2" }} />
+            <button
+              onClick={async () => {
+                if (!newContactName.trim()) return;
+                const created = await createContact({ dealer_id: DEALER_ID, name: newContactName.trim(), phone: newContactPhone || null });
+                if (created?.[0]) setContacts((prev) => [...prev, created[0]].sort((a, b) => a.name.localeCompare(b.name)));
+                setNewContactName(""); setNewContactPhone("");
+              }}
+              className="text-sm font-medium px-4 py-2 rounded-sm text-white" style={{ background: "#3A5A5E" }}
+            >Add</button>
+          </div>
+          <p className="text-xs mb-2" style={{ color: "#8A8272" }}>Import from a CSV with columns: name, phone (one per line, header row optional)</p>
+          <input
+            type="file"
+            accept=".csv"
+            onChange={async (e) => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              const text = await file.text();
+              const rows = text.split("\n").map((r) => r.trim()).filter(Boolean);
+              const dataRows = rows[0]?.toLowerCase().includes("name") ? rows.slice(1) : rows;
+              let count = 0;
+              for (const row of dataRows) {
+                const [name, phone] = row.split(",").map((v) => v?.trim().replace(/^"|"$/g, ""));
+                if (!name) continue;
+                try {
+                  const created = await createContact({ dealer_id: DEALER_ID, name, phone: phone || null });
+                  if (created?.[0]) setContacts((prev) => [...prev, created[0]]);
+                  count++;
+                } catch (err) { /* skip row on failure */ }
+              }
+              setContacts((prev) => [...prev].sort((a, b) => a.name.localeCompare(b.name)));
+              setImportStatus(`Imported ${count} contacts.`);
+            }}
+            className="text-xs"
+          />
+          {importStatus && <p className="text-xs mt-2" style={{ color: "#3A5A5E" }}>{importStatus}</p>}
+          <div className="mt-3 max-h-40 overflow-y-auto">
+            {contacts.map((c) => (
+              <div key={c.id} className="text-xs py-1 border-b" style={{ borderColor: "#EFEAE0", color: "#6B6555" }}>{c.name}{c.phone ? ` · ${c.phone}` : ""}</div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {showImport && (
+        <div className="border-2 rounded-sm p-4 mb-6" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
+          <p className="text-xs uppercase tracking-wide mb-2" style={{ color: "#6B6555" }}>Bulk import existing stock</p>
+          <p className="text-xs mb-3" style={{ color: "#8A8272" }}>
+            CSV columns (header row required): model, storage, color, cost_price, price, bought_from, imei_full, warranty_months
+          </p>
+          <input
+            type="file"
+            accept=".csv"
+            onChange={async (e) => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              const text = await file.text();
+              const rows = text.split("\n").map((r) => r.trim()).filter(Boolean);
+              const headers = rows[0].split(",").map((h) => h.trim().toLowerCase());
+              let count = 0;
+              for (const row of rows.slice(1)) {
+                const values = row.split(",").map((v) => v.trim().replace(/^"|"$/g, ""));
+                const rowData = Object.fromEntries(headers.map((h, i) => [h, values[i] || ""]));
+                if (!rowData.model) continue;
+                try {
+                  await createListing({
+                    dealer_id: DEALER_ID,
+                    model: rowData.model,
+                    storage: rowData.storage || null,
+                    color: rowData.color || null,
+                    cost_price: rowData.cost_price ? Number(rowData.cost_price) : null,
+                    price: Number(rowData.price) || 0,
+                    bought_from: rowData.bought_from || null,
+                    imei_full: rowData.imei_full || null,
+                    warranty_months: rowData.warranty_months ? Number(rowData.warranty_months) : null,
+                    stock_type: "pre_owned",
+                    status: "available",
+                  });
+                  count++;
+                } catch (err) { /* skip row on failure */ }
+              }
+              setImportStatus(`Imported ${count} phones.`);
+              await refresh();
+            }}
+            className="text-xs"
+          />
+          {importStatus && <p className="text-xs mt-2" style={{ color: "#3A5A5E" }}>{importStatus}</p>}
+        </div>
+      )}
 
       {loadError && (
         <div className="border rounded-sm p-3 mb-4 text-sm" style={{ borderColor: "#A8452F", background: "#F3E1DC", color: "#A8452F" }}>
@@ -351,7 +476,11 @@ export default function StockLedgerLive() {
             <input placeholder="Storage" value={draft.storage} onChange={(e) => setDraft({ ...draft, storage: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
             <input placeholder="Color" value={draft.color} onChange={(e) => setDraft({ ...draft, color: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
             <input placeholder="IMEI" value={draft.imei_full} onChange={(e) => setDraft({ ...draft, imei_full: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
-            <input placeholder="Bought from" value={draft.bought_from} onChange={(e) => setDraft({ ...draft, bought_from: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm col-span-2" style={{ borderColor: "#D8D2C2" }} />
+            <input list="contact-names" placeholder="Bought from" value={draft.bought_from} onChange={(e) => setDraft({ ...draft, bought_from: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
+            <input list="contact-names" placeholder="Sold to (once sold)" value={draft.sold_to} onChange={(e) => setDraft({ ...draft, sold_to: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
+            <datalist id="contact-names">
+              {contacts.map((c) => (<option key={c.id} value={c.name} />))}
+            </datalist>
             <input placeholder="Cost price" type="number" value={draft.cost_price} onChange={(e) => setDraft({ ...draft, cost_price: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
             <input placeholder="Selling price" type="number" value={draft.price} onChange={(e) => setDraft({ ...draft, price: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
             <input placeholder="Warranty (months)" type="number" value={draft.warranty_months} onChange={(e) => setDraft({ ...draft, warranty_months: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm col-span-2 md:col-span-1" style={{ borderColor: "#D8D2C2" }} />
