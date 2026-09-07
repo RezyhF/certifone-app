@@ -286,7 +286,7 @@ export default function StockLedgerLive() {
             <button onClick={() => fileInputRef.current?.click()} className="flex items-center justify-center gap-2 text-white text-sm font-medium px-5 py-3 rounded-sm hover:opacity-90" style={{ background: "#1C1B19" }}>
               <Camera size={16} /> Photo of box / IMEI
             </button>
-            <input ref={fileInputRef} type="file" accept="image/*" capture="environment" onChange={handlePhoto} className="hidden" />
+            <input ref={fileInputRef} type="file" accept="image/*" onChange={handlePhoto} className="hidden" />
             <button onClick={recording ? stopVoice : startVoice} className="flex items-center justify-center gap-2 text-white text-sm font-medium px-5 py-3 rounded-sm hover:opacity-90" style={{ background: recording ? "#A8452F" : "#3A5A5E" }}>
               {recording ? <Square size={15} /> : <Mic size={16} />} {recording ? "Stop & process" : "Voice note"}
             </button>
