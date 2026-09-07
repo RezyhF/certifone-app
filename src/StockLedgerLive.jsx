@@ -168,7 +168,6 @@ export default function StockLedgerLive() {
         } catch (err) {
           setError("Couldn't transcribe that — try again, or type it instead.");
           setVoiceStatus("");
-          setStep("idle");
         }
       };
       mediaRecorderRef.current = recorder;
@@ -327,6 +326,17 @@ export default function StockLedgerLive() {
           {photoPreview && <img src={photoPreview} alt="captured" className="w-20 h-20 object-cover rounded-sm border mb-3" style={{ borderColor: "#D8D2C2" }} />}
           {voiceTranscript && <p className="text-xs italic mb-3 px-2.5 py-2 rounded-sm" style={{ background: "#EFEAE0", color: "#6B6555" }}>"{voiceTranscript}"</p>}
           {error && <p className="text-xs mb-3" style={{ color: "#A8452F" }}>{error}</p>}
+
+          <button
+            onClick={recording ? stopVoice : startVoice}
+            className="mb-3 text-xs font-medium px-3 py-2 rounded-sm text-white hover:opacity-90 flex items-center gap-1.5"
+            style={{ background: recording ? "#A8452F" : "#3A5A5E" }}
+          >
+            {recording ? <Square size={12} /> : <Mic size={12} />} {recording ? "Stop & add to this phone" : "Add a voice note (cost, price, notes…)"}
+          </button>
+          {voiceStatus === "listening" && <p className="text-xs mb-3 animate-pulse" style={{ color: "#A8452F" }}>Listening…</p>}
+          {voiceStatus === "thinking" && <p className="text-xs mb-3 flex items-center gap-1.5" style={{ color: "#6B6555" }}><Loader2 size={12} className="animate-spin" /> Adding that in…</p>}
+
           <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
             <input placeholder="Model" value={draft.model} onChange={(e) => setDraft({ ...draft, model: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm col-span-2 md:col-span-1" style={{ borderColor: "#D8D2C2" }} />
             <input placeholder="Storage" value={draft.storage} onChange={(e) => setDraft({ ...draft, storage: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
