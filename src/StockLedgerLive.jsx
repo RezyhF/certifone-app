@@ -11,6 +11,8 @@ const STATUSES = [
   { key: "sold_unpaid", label: "Sold — Unpaid", pub: false, dot: "#A8452F", bg: "#F3E1DC" },
   { key: "sold_paid", label: "Sold — Paid", pub: false, dot: "#3A5A5E", bg: "#E2EAEA" },
   { key: "waiting_parts", label: "Waiting for Parts", pub: false, dot: "#8A7B5C", bg: "#EFEAE0" },
+  { key: "returned_faulty", label: "Returned — Faulty", pub: false, dot: "#9B3D3D", bg: "#F5DEDE" },
+  { key: "returned_supplier", label: "Returned to Supplier", pub: false, dot: "#6B5B7B", bg: "#E9E2EF" },
 ];
 
 const EXPENSE_CATEGORIES = [
@@ -100,7 +102,7 @@ export default function StockLedgerLive() {
   const [importStatus, setImportStatus] = useState("");
   const [saleStep, setSaleStep] = useState("idle"); // idle, listening, matching, confirm
   const [saleTranscript, setSaleTranscript] = useState("");
-  const [saleMatch, setSaleMatch] = useState(null); // { listing, sold_to, paid }
+  const [saleMatches, setSaleMatches] = useState([]); // [{ listing, action, sold_to, paid, resolved }]
   const [saleError, setSaleError] = useState("");
   const saleRecorderRef = useRef(null);
   const saleChunksRef = useRef([]);
@@ -234,31 +236,49 @@ export default function StockLedgerLive() {
   const openManual = () => { setDraft(blankDraft); setPhotoPreview(null); setVoiceTranscript(""); setError(""); setStep("review"); };
   const reset = () => { setStep("idle"); setDraft(blankDraft); setPhotoPreview(null); setVoiceTranscript(""); setError(""); };
 
-  // --- Mark a sale by voice: transcribe, then have Claude match it against current stock ---
+  // --- Voice-note actions: sales AND returns, possibly several in one recording ---
   const matchSaleFromTranscript = async (transcript) => {
     setSaleTranscript(transcript);
     setSaleStep("matching");
     try {
-      const candidates = items
-        .filter((i) => i.status === "available" || i.status === "reserved")
-        .map((i) => ({ id: i.id, model: i.model, storage: i.storage, color: i.color, imei_last4: i.imei_last4, price: i.price }));
+      // Candidates cover every non-archived listing, since a return references something
+      // already sold, not just current available stock.
+      const candidates = items.map((i) => ({
+        id: i.id, model: i.model, storage: i.storage, color: i.color,
+        imei_last4: i.imei_last4, price: i.price, status: i.status,
+      }));
 
       const result = await askClaude([
-        { type: "text", text: `A phone dealer said this out loud to mark a sale: "${transcript}". Here is their current available stock as JSON: ${JSON.stringify(candidates)}. Identify which single listing (by id) this most likely refers to, based on model/storage/color/IMEI digits mentioned. Also extract who it was sold to (a name, if mentioned) and whether they said it's been paid for yet. Respond ONLY with raw JSON, no markdown: {"listing_id": "", "sold_to": "", "paid": false}. If you cannot confidently match any listing, set listing_id to an empty string.` },
+        { type: "text", text: `A phone dealer said this while updating stock: "${transcript}". This may describe ONE or SEVERAL separate actions. Here is their current stock as JSON, including each item's current status: ${JSON.stringify(candidates)}.
+
+For each distinct action mentioned, identify:
+- which listing (by id) it refers to
+- the action type: "sold" (a new sale — item should currently be available/reserved), "returned_faulty" (customer returned it, e.g. currently sold_paid/sold_unpaid and they mention a fault, refund, or return), or "returned_supplier" (sending an already-faulty-returned item back to whoever supplied it)
+- for "sold" actions only: who it was sold to (sold_to) and whether they said it's paid
+
+Respond ONLY with raw JSON, no markdown: {"actions": [{"listing_id": "", "action": "", "sold_to": "", "paid": false}]}. If you cannot confidently match an action to any listing, omit it rather than guessing.` },
       ]);
 
-      const matchedListing = items.find((i) => i.id === result.listing_id);
-      if (!matchedListing) {
-        setSaleError("Couldn't confidently match that to a phone in stock — pick it manually below.");
-        setSaleMatch({ listing: null, sold_to: result.sold_to || "", paid: !!result.paid });
+      const actions = result.actions || [];
+      const matches = actions.map((a) => ({
+        listing: items.find((i) => i.id === a.listing_id) || null,
+        action: a.action || "sold",
+        sold_to: a.sold_to || "",
+        paid: !!a.paid,
+        resolved: false,
+      }));
+
+      if (matches.length === 0) {
+        setSaleError("Couldn't confidently match that to anything in stock — pick it manually below.");
+        setSaleMatches([{ listing: null, action: "sold", sold_to: "", paid: false, resolved: false }]);
       } else {
         setSaleError("");
-        setSaleMatch({ listing: matchedListing, sold_to: result.sold_to || "", paid: !!result.paid });
+        setSaleMatches(matches);
       }
       setSaleStep("confirm");
     } catch (err) {
-      setSaleError("Had trouble matching that (" + err.message + ") — pick the phone manually below.");
-      setSaleMatch({ listing: null, sold_to: "", paid: false });
+      setSaleError("Had trouble matching that (" + err.message + ") — pick manually below.");
+      setSaleMatches([{ listing: null, action: "sold", sold_to: "", paid: false, resolved: false }]);
       setSaleStep("confirm");
     }
   };
@@ -295,25 +315,37 @@ export default function StockLedgerLive() {
   };
   const stopSaleVoice = () => saleRecorderRef.current?.stop();
 
-  const confirmSale = async () => {
-    if (!saleMatch?.listing) return;
+  const ACTION_TO_STATUS = { sold: (paid) => (paid ? "sold_paid" : "sold_unpaid"), returned_faulty: () => "returned_faulty", returned_supplier: () => "returned_supplier" };
+  const ACTION_LABEL = { sold: "Mark sold", returned_faulty: "Mark returned — faulty", returned_supplier: "Mark returned to supplier" };
+
+  const confirmSaleAt = async (index) => {
+    const m = saleMatches[index];
+    if (!m?.listing) return;
     try {
-      await updateListing(saleMatch.listing.id, {
-        status: saleMatch.paid ? "sold_paid" : "sold_unpaid",
-        sold_to: saleMatch.sold_to || null,
-      });
-      await ensureContact(saleMatch.sold_to);
+      const updates = { status: ACTION_TO_STATUS[m.action](m.paid) };
+      if (m.action === "sold") updates.sold_to = m.sold_to || null;
+      await updateListing(m.listing.id, updates);
+      if (m.action === "sold") await ensureContact(m.sold_to);
       await refresh();
-      setSaleStep("idle");
-      setSaleMatch(null);
-      setSaleTranscript("");
+      setSaleMatches((prev) => prev.map((x, i) => (i === index ? { ...x, resolved: true } : x)));
     } catch (err) {
-      setSaleError("Couldn't save that sale (" + err.message + ") — try again.");
+      setSaleError("Couldn't save that (" + err.message + ") — try again.");
     }
   };
 
-  const rejectSaleMatch = () => {
-    setSaleMatch((prev) => ({ ...prev, listing: null }));
+  const rejectSaleMatchAt = (index) => {
+    setSaleMatches((prev) => prev.map((x, i) => (i === index ? { ...x, listing: null } : x)));
+  };
+
+  const pickManualListingAt = (index, listing) => {
+    setSaleMatches((prev) => prev.map((x, i) => (i === index ? { ...x, listing } : x)));
+  };
+
+  const closeSaleFlow = () => {
+    setSaleStep("idle");
+    setSaleMatches([]);
+    setSaleTranscript("");
+    setSaleError("");
   };
 
   // --- Simple fuzzy name matching: exact, or one name contains the other, or shared first name ---
@@ -694,9 +726,9 @@ export default function StockLedgerLive() {
 
       {step === "idle" && saleStep === "idle" && (
         <div className="border-2 rounded-sm p-4 mb-6 text-center" style={{ borderColor: "#D8D2C2", background: "#FBFAF6" }}>
-          <p className="text-xs uppercase tracking-wide mb-3" style={{ color: "#6B6555" }}>Or mark an existing phone as sold — just say it</p>
+          <p className="text-xs uppercase tracking-wide mb-3" style={{ color: "#6B6555" }}>Or update existing stock — sales, faulty returns, supplier returns. Say as many as you like in one go.</p>
           <button onClick={startSaleVoice} className="text-sm font-medium px-5 py-3 rounded-sm text-white hover:opacity-90 flex items-center gap-2 mx-auto" style={{ background: "#A8452F" }}>
-            <Mic size={16} /> "I sold the iPhone 12 to Kyle..."
+            <Mic size={16} /> "I sold the iPhone 12 to Kyle, and the Samsung came back faulty..."
           </button>
           {saleError && <p className="text-xs mt-3" style={{ color: "#A8452F" }}>{saleError}</p>}
         </div>
@@ -704,7 +736,7 @@ export default function StockLedgerLive() {
 
       {saleStep === "listening" && (
         <div className="border-2 rounded-sm p-4 mb-6 text-center" style={{ borderColor: "#A8452F", background: "#F3E1DC" }}>
-          <p className="text-sm mb-3 animate-pulse" style={{ color: "#A8452F" }}>Listening… describe the phone and who it went to</p>
+          <p className="text-sm mb-3 animate-pulse" style={{ color: "#A8452F" }}>Listening… describe any sales or returns</p>
           <button onClick={stopSaleVoice} className="text-sm font-medium px-5 py-3 rounded-sm text-white" style={{ background: "#A8452F" }}>
             <Square size={14} className="inline mr-1.5" /> Stop
           </button>
@@ -720,55 +752,58 @@ export default function StockLedgerLive() {
 
       {saleStep === "confirm" && (
         <div className="border-2 rounded-sm p-4 mb-6" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
-          <p className="text-xs uppercase tracking-wide mb-2" style={{ color: "#6B6555" }}>Confirm this sale</p>
+          <p className="text-xs uppercase tracking-wide mb-2" style={{ color: "#6B6555" }}>Confirm {saleMatches.length > 1 ? `these ${saleMatches.length} updates` : "this update"}</p>
           {saleTranscript && <p className="text-xs italic mb-3 px-2.5 py-2 rounded-sm" style={{ background: "#EFEAE0", color: "#6B6555" }}>"{saleTranscript}"</p>}
           {saleError && <p className="text-xs mb-3" style={{ color: "#A8452F" }}>{saleError}</p>}
 
-          {saleMatch?.listing ? (
-            <>
-              <div className="border rounded-sm p-3 mb-3" style={{ borderColor: "#D8D2C2" }}>
-                <p className="text-sm font-semibold">Is this the phone?</p>
-                <p className="text-sm mt-1">{saleMatch.listing.model} {saleMatch.listing.storage} · {saleMatch.listing.color}</p>
-                <p className="text-xs mt-0.5" style={{ color: "#8A8272" }}>IMEI ···{saleMatch.listing.imei_last4 || "—"} · R{Number(saleMatch.listing.price).toLocaleString()}</p>
-              </div>
-              <div className="grid grid-cols-2 gap-2.5 mb-3">
-                <input list="contact-names" placeholder="Sold to" value={saleMatch.sold_to} onChange={(e) => setSaleMatch({ ...saleMatch, sold_to: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
-                <select value={saleMatch.paid ? "paid" : "unpaid"} onChange={(e) => setSaleMatch({ ...saleMatch, paid: e.target.value === "paid" })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }}>
-                  <option value="unpaid">Not paid yet</option>
-                  <option value="paid">Paid</option>
-                </select>
-              </div>
-              <div className="flex gap-2">
-                <button onClick={confirmSale} className="text-sm font-medium px-4 py-2 rounded-sm text-white flex items-center gap-1.5" style={{ background: "#3A5A5E" }}>
-                  <Check size={14} /> Yes, mark it sold
-                </button>
-                <button onClick={rejectSaleMatch} className="text-sm font-medium px-4 py-2 rounded-sm border" style={{ borderColor: "#D8D2C2", color: "#6B6555" }}>
-                  Not this one
-                </button>
-              </div>
-            </>
-          ) : (
-            <>
-              <p className="text-xs mb-2" style={{ color: "#6B6555" }}>Pick the phone manually:</p>
-              <select
-                onChange={(e) => {
-                  const listing = items.find((i) => i.id === e.target.value);
-                  setSaleMatch((prev) => ({ ...prev, listing }));
-                }}
-                className="border px-2.5 py-2 text-sm rounded-sm w-full mb-3"
-                style={{ borderColor: "#D8D2C2" }}
-                defaultValue=""
-              >
-                <option value="" disabled>Select a phone…</option>
-                {items.filter((i) => i.status === "available" || i.status === "reserved").map((i) => (
-                  <option key={i.id} value={i.id}>{i.model} {i.storage} · {i.color} · R{i.price}</option>
-                ))}
-              </select>
-            </>
-          )}
+          {saleMatches.map((m, idx) => (
+            <div key={idx} className="border rounded-sm p-3 mb-3" style={{ borderColor: m.resolved ? "#6B8F71" : "#D8D2C2", background: m.resolved ? "#EAF0E9" : "transparent" }}>
+              {m.resolved ? (
+                <p className="text-sm flex items-center gap-1.5" style={{ color: "#3A5A5E" }}><Check size={14} /> Done — {m.listing.model} {m.listing.storage} updated.</p>
+              ) : m.listing ? (
+                <>
+                  <p className="text-sm font-semibold">{ACTION_LABEL[m.action]} — is this the phone?</p>
+                  <p className="text-sm mt-1">{m.listing.model} {m.listing.storage} · {m.listing.color}</p>
+                  <p className="text-xs mt-0.5 mb-2" style={{ color: "#8A8272" }}>IMEI ···{m.listing.imei_last4 || "—"} · R{Number(m.listing.price).toLocaleString()} · currently {STATUSES.find((s) => s.key === m.listing.status)?.label}</p>
+                  {m.action === "sold" && (
+                    <div className="grid grid-cols-2 gap-2.5 mb-2">
+                      <input list="contact-names" placeholder="Sold to" value={m.sold_to} onChange={(e) => setSaleMatches((prev) => prev.map((x, i) => (i === idx ? { ...x, sold_to: e.target.value } : x)))} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
+                      <select value={m.paid ? "paid" : "unpaid"} onChange={(e) => setSaleMatches((prev) => prev.map((x, i) => (i === idx ? { ...x, paid: e.target.value === "paid" } : x)))} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }}>
+                        <option value="unpaid">Not paid yet</option>
+                        <option value="paid">Paid</option>
+                      </select>
+                    </div>
+                  )}
+                  <div className="flex gap-2">
+                    <button onClick={() => confirmSaleAt(idx)} className="text-sm font-medium px-4 py-2 rounded-sm text-white flex items-center gap-1.5" style={{ background: "#3A5A5E" }}>
+                      <Check size={14} /> Yes, confirm
+                    </button>
+                    <button onClick={() => rejectSaleMatchAt(idx)} className="text-sm font-medium px-4 py-2 rounded-sm border" style={{ borderColor: "#D8D2C2", color: "#6B6555" }}>
+                      Not this one
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p className="text-xs mb-2" style={{ color: "#6B6555" }}>Pick the phone manually:</p>
+                  <select
+                    onChange={(e) => pickManualListingAt(idx, items.find((i) => i.id === e.target.value))}
+                    className="border px-2.5 py-2 text-sm rounded-sm w-full"
+                    style={{ borderColor: "#D8D2C2" }}
+                    defaultValue=""
+                  >
+                    <option value="" disabled>Select a phone…</option>
+                    {items.map((i) => (
+                      <option key={i.id} value={i.id}>{i.model} {i.storage} · {i.color} · {STATUSES.find((s) => s.key === i.status)?.label}</option>
+                    ))}
+                  </select>
+                </>
+              )}
+            </div>
+          ))}
 
-          <button onClick={() => { setSaleStep("idle"); setSaleMatch(null); setSaleTranscript(""); setSaleError(""); }} className="text-xs mt-2 flex items-center gap-1" style={{ color: "#8A8272" }}>
-            <RotateCcw size={12} /> Cancel
+          <button onClick={closeSaleFlow} className="text-xs mt-1 flex items-center gap-1" style={{ color: "#8A8272" }}>
+            <RotateCcw size={12} /> {saleMatches.every((m) => m.resolved) ? "Done" : "Cancel"}
           </button>
         </div>
       )}
