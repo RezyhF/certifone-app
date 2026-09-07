@@ -90,6 +90,8 @@ export default function StockLedgerLive() {
   const [saving, setSaving] = useState(false);
   const fileInputRef = useRef(null);
   const recognitionRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
 
   const refresh = async () => {
     try {
@@ -145,24 +147,43 @@ export default function StockLedgerLive() {
     }
   };
 
-  const startVoice = () => {
+  const startVoice = async () => {
     setError("");
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
-      setError("Voice capture needs Chrome or Safari on this device.");
-      return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (e) => audioChunksRef.current.push(e.data);
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        setVoiceStatus("thinking");
+        try {
+          const audioBlob = new Blob(audioChunksRef.current, { type: "audio/webm" });
+          const formData = new FormData();
+          formData.append("audio", audioBlob, "recording.webm");
+          const res = await fetch("/api/transcribe", { method: "POST", body: formData });
+          const data = await res.json();
+          if (!res.ok || data.error) throw new Error(data.error || "Transcription failed");
+          await parseNote(data.transcript);
+        } catch (err) {
+          setError("Couldn't transcribe that — try again, or type it instead.");
+          setVoiceStatus("");
+          setStep("idle");
+        }
+      };
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setRecording(true);
+      setVoiceStatus("listening");
+    } catch (err) {
+      setError("Couldn't access the microphone — check permissions, or type it instead.");
     }
-    const rec = new SR();
-    rec.lang = "en-ZA";
-    rec.interimResults = false;
-    rec.onstart = () => { setRecording(true); setVoiceStatus("listening"); };
-    rec.onerror = () => { setRecording(false); setVoiceStatus(""); setError("Didn't catch that — try again."); };
-    rec.onresult = (e) => parseNote(e.results[0][0].transcript);
-    recognitionRef.current = rec;
-    rec.start();
   };
 
-  const stopVoice = () => recognitionRef.current?.stop();
+  const stopVoice = () => {
+    mediaRecorderRef.current?.stop();
+    setRecording(false);
+  };
   const openManual = () => { setDraft(blankDraft); setPhotoPreview(null); setVoiceTranscript(""); setError(""); setStep("review"); };
   const reset = () => { setStep("idle"); setDraft(blankDraft); setPhotoPreview(null); setVoiceTranscript(""); setError(""); };
 
