@@ -18,10 +18,12 @@ export default {
         openaiForm.append("file", audioFile, "recording.webm");
         openaiForm.append("model", "whisper-1");
 
+        const openaiKey = await env.OPENAI_API_KEY.get();
+
         const openaiRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
           method: "POST",
           headers: {
-            Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+            Authorization: `Bearer ${openaiKey}`,
           },
           body: openaiForm,
         });
