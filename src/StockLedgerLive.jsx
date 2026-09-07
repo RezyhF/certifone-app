@@ -1,8 +1,8 @@
 import { useState, useRef, useEffect } from "react";
 import { Camera, Mic, Square, Loader2, Check, X, TrendingUp, Package, Smartphone, RotateCcw } from "lucide-react";
 
-const SUPABASE_URL = "https://oxrbmxhzstzvdrwluqyu.supabase.co";
-const SUPABASE_KEY = "sb_publishable_LOzzjMbQ5AFQnJqwW-cRtw_NktvyPdv";
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_KEY;
 const DEALER_ID = "11111111-1111-1111-1111-111111111111"; // Duncan's dealer record
 
 const STATUSES = [
@@ -368,6 +368,15 @@ export default function StockLedgerLive() {
               <select value={item.status} onChange={(e) => setStatus(item.id, e.target.value)} className="text-xs px-2.5 py-1.5 rounded-sm border-none font-medium cursor-pointer" style={{ background: st.bg, color: st.dot }}>
                 {STATUSES.map((s) => (<option key={s.key} value={s.key}>{s.label}</option>))}
               </select>
+              {item.status === "sold_unpaid" && (
+                <button
+                  onClick={() => setStatus(item.id, "sold_paid")}
+                  className="text-xs px-2.5 py-1.5 rounded-sm font-medium text-white hover:opacity-90 flex items-center gap-1"
+                  style={{ background: "#3A5A5E" }}
+                >
+                  <Check size={12} /> Mark Paid
+                </button>
+              )}
               <button onClick={() => removeItem(item.id)} className="p-1.5 hover:opacity-60" style={{ color: "#8A8272" }}><X size={15} /></button>
             </div>
           );
