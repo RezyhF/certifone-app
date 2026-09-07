@@ -5,3 +5,13 @@ compatibility_date = "2026-01-01"
 [assets]
 directory = "./dist"
 binding = "ASSETS"
+
+[[secrets_store_secrets]]
+binding = "OPENAI_API_KEY"
+store_id = "e40a383930a74abe9e5f998a7cc4002d"
+secret_name = "OPENAI_API_KEY"
+
+[[secrets_store_secrets]]
+binding = "ANTHROPIC_API_KEY"
+store_id = "e40a383930a74abe9e5f998a7cc4002d"
+secret_name = "ANTHROPIC_API_KEY"
