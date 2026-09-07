@@ -3,6 +3,7 @@ import { Camera, Mic, Square, Loader2, Check, X, TrendingUp, Package, Smartphone
 
 const SUPABASE_URL = "https://oxrbmxhzstzvdrwluqyu.supabase.co";
 const SUPABASE_KEY = "sb_publishable_LOzzjMbQ5AFQnJqwW-cRtw_NktvyPdv";
+const DEALER_ID = "11111111-1111-1111-1111-111111111111"; // Duncan's dealer record
 
 const STATUSES = [
   { key: "available", label: "Available", pub: true, dot: "#6B8F71", bg: "#EAF0E9" },
@@ -12,7 +13,16 @@ const STATUSES = [
   { key: "waiting_parts", label: "Waiting for Parts", pub: false, dot: "#8A7B5C", bg: "#EFEAE0" },
 ];
 
-const blankDraft = { model: "", storage: "", color: "", cost_price: "", price: "", warranty_months: "", bought_from: "", imei_full: "", condition_score: "" };
+const EXPENSE_CATEGORIES = [
+  { key: "shipping", label: "Shipping" },
+  { key: "repairs", label: "Repairs" },
+  { key: "accessories", label: "Accessories" },
+  { key: "labour", label: "Labour" },
+  { key: "petrol", label: "Petrol / Courier" },
+  { key: "sundry", label: "Sundry / Other" },
+];
+
+const blankDraft = { model: "", storage: "", color: "", cost_price: "", price: "", warranty_months: "", bought_from: "", imei_full: "", condition_score: "", expenses: {} };
 
 // --- Supabase REST helpers (direct fetch, no client library needed) ---
 async function sbFetch(path, options = {}) {
@@ -34,8 +44,9 @@ async function sbFetch(path, options = {}) {
   return res.json();
 }
 
-const getListings = () => sbFetch("listings?is_archived=eq.false&order=created_at.desc");
+const getListings = () => sbFetch("listings?is_archived=eq.false&select=*,expenses(category,amount)&order=created_at.desc");
 const createListing = (data) => sbFetch("listings", { method: "POST", body: JSON.stringify(data) });
+const createExpense = (data) => sbFetch("expenses", { method: "POST", body: JSON.stringify(data) });
 const updateListingStatus = (id, status) =>
   sbFetch(`listings?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status, updated_at: new Date().toISOString() }) });
 const archiveListing = (id) =>
@@ -160,7 +171,8 @@ export default function StockLedgerLive() {
     setSaving(true);
     setError("");
     try {
-      await createListing({
+      const created = await createListing({
+        dealer_id: DEALER_ID,
         model: draft.model,
         storage: draft.storage || null,
         color: draft.color || null,
@@ -173,6 +185,15 @@ export default function StockLedgerLive() {
         stock_type: "pre_owned",
         status: "available",
       });
+      const newListingId = created?.[0]?.id;
+      const expenseEntries = Object.entries(draft.expenses || {}).filter(([, v]) => v && Number(v) > 0);
+      if (newListingId && expenseEntries.length > 0) {
+        await Promise.all(
+          expenseEntries.map(([category, amount]) =>
+            createExpense({ dealer_id: DEALER_ID, listing_id: newListingId, category, amount: Number(amount) })
+          )
+        );
+      }
       await refresh();
       reset();
     } catch (err) {
@@ -202,7 +223,10 @@ export default function StockLedgerLive() {
 
   const visible = filter === "all" ? items : items.filter((i) => i.status === filter);
   const totalStock = items.filter((i) => i.status !== "sold_paid").length;
-  const grossProfit = items.filter((i) => i.status === "sold_paid").reduce((s, i) => s + ((i.price || 0) - (i.cost_price || 0)), 0);
+  const expensesTotal = (item) => (item.expenses || []).reduce((s, e) => s + Number(e.amount || 0), 0);
+  const grossProfit = items
+    .filter((i) => i.status === "sold_paid")
+    .reduce((s, i) => s + ((i.price || 0) - (i.cost_price || 0) - expensesTotal(i)), 0);
   const publicCount = items.filter((i) => STATUSES.find((s) => s.key === i.status)?.pub).length;
 
   return (
@@ -292,6 +316,23 @@ export default function StockLedgerLive() {
             <input placeholder="Selling price" type="number" value={draft.price} onChange={(e) => setDraft({ ...draft, price: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
             <input placeholder="Warranty (months)" type="number" value={draft.warranty_months} onChange={(e) => setDraft({ ...draft, warranty_months: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm col-span-2 md:col-span-1" style={{ borderColor: "#D8D2C2" }} />
           </div>
+
+          <p className="text-xs uppercase tracking-wide mt-4 mb-2" style={{ color: "#6B6555" }}>Expenses for this phone (optional)</p>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-2.5">
+            {EXPENSE_CATEGORIES.map((cat) => (
+              <div key={cat.key} className="flex items-center gap-2">
+                <label className="text-xs w-24 flex-shrink-0" style={{ color: "#6B6555" }}>{cat.label}</label>
+                <input
+                  type="number"
+                  placeholder="R0"
+                  value={draft.expenses[cat.key] || ""}
+                  onChange={(e) => setDraft({ ...draft, expenses: { ...draft.expenses, [cat.key]: e.target.value } })}
+                  className="border px-2 py-1.5 text-sm rounded-sm flex-1 w-full"
+                  style={{ borderColor: "#D8D2C2" }}
+                />
+              </div>
+            ))}
+          </div>
           <button onClick={saveDraft} disabled={saving} className="mt-3 text-white text-sm font-medium px-4 py-2 rounded-sm hover:opacity-90 flex items-center gap-2 disabled:opacity-50" style={{ background: "#3A5A5E" }}>
             {saving ? <Loader2 size={15} className="animate-spin" /> : <Check size={15} />} {saving ? "Saving…" : "Confirm & save to ledger"}
           </button>
@@ -318,7 +359,10 @@ export default function StockLedgerLive() {
             <div key={item.id} className="border-b py-3 flex flex-wrap items-center gap-3 md:gap-4" style={{ borderColor: "#D8D2C2" }}>
               <div className="min-w-[140px] flex-1">
                 <div className="font-semibold text-sm">{item.model} <span className="font-normal" style={{ color: "#6B6555" }}>{item.storage} · {item.color}</span></div>
-                <div className="text-xs mt-0.5" style={{ color: "#8A8272" }}>IMEI ···{item.imei_last4 || "—"} · from {item.bought_from || "—"}</div>
+                <div className="text-xs mt-0.5" style={{ color: "#8A8272" }}>
+                  IMEI ···{item.imei_last4 || "—"} · from {item.bought_from || "—"}
+                  {expensesTotal(item) > 0 && <> · expenses R{expensesTotal(item).toLocaleString()}</>}
+                </div>
               </div>
               <div style={{ fontFamily: "'Roboto Slab', serif" }} className="text-sm font-bold w-20 text-right">R{Number(item.price || 0).toLocaleString()}</div>
               <select value={item.status} onChange={(e) => setStatus(item.id, e.target.value)} className="text-xs px-2.5 py-1.5 rounded-sm border-none font-medium cursor-pointer" style={{ background: st.bg, color: st.dot }}>
