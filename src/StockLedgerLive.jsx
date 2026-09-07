@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { Camera, Mic, Square, Loader2, Check, X, TrendingUp, Package, Smartphone, RotateCcw } from "lucide-react";
+import { Camera, Mic, Square, Loader2, Check, X, TrendingUp, Package, Smartphone, RotateCcw, Pencil } from "lucide-react";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_KEY;
@@ -100,12 +100,15 @@ export default function StockLedgerLive() {
   const contactChunksRef = useRef([]);
   const [newContactPhone, setNewContactPhone] = useState("");
   const [importStatus, setImportStatus] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editDraft, setEditDraft] = useState(null);
+  const [contactPrompt, setContactPrompt] = useState(null); // { name, similar, showChoices }
+  const contactResolveRef = useRef(null);
+  const contactPromptFileInputRef = useRef(null);
   const [saleStep, setSaleStep] = useState("idle"); // idle, listening, matching, confirm
   const [saleTranscript, setSaleTranscript] = useState("");
   const [saleMatches, setSaleMatches] = useState([]); // [{ listing, action, sold_to, paid, resolved }]
   const [saleError, setSaleError] = useState("");
-  const saleRecorderRef = useRef(null);
-  const saleChunksRef = useRef([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [filter, setFilter] = useState("all");
@@ -142,32 +145,100 @@ export default function StockLedgerLive() {
 
   // Ensures a "bought from" / "sold to" name exists as a contact, creating it if new.
   // Returns silently on failure so contact-linking never blocks a save.
-  const ensureContact = async (name) => {
-    if (!name || !name.trim()) return;
-    const trimmed = name.trim();
-    if (contacts.some((c) => c.name.toLowerCase() === trimmed.toLowerCase())) return;
+  // Pauses the save flow and asks the user to confirm/select/create the contact.
+  // Resolves with the final name to store once the user has answered.
+  const resolveContact = (name) => {
+    return new Promise((resolve) => {
+      if (!name || !name.trim()) return resolve(null);
+      const trimmed = name.trim();
+      const similar = findSimilarContacts(trimmed);
+      const exact = similar.find((c) => c.name.toLowerCase() === trimmed.toLowerCase());
+      if (exact) return resolve(exact.name); // already an exact match, no need to ask
+      contactResolveRef.current = resolve;
+      setContactPrompt({ name: trimmed, similar, showChoices: similar.length === 0 });
+    });
+  };
+
+  const answerContactPrompt = (finalName) => {
+    contactResolveRef.current?.(finalName);
+    contactResolveRef.current = null;
+    setContactPrompt(null);
+  };
+
+  const handleContactPromptPhoto = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
     try {
-      const created = await createContact({ dealer_id: DEALER_ID, name: trimmed });
+      const base64 = await fileToBase64(file);
+      const result = await askClaude([
+        { type: "image", source: { type: "base64", media_type: file.type, data: base64 } },
+        { type: "text", text: 'This is a screenshot of a phone contact card or chat. Read the person\'s name and phone number. Respond ONLY with raw JSON: {"name": "", "phone": ""}. Empty string if not visible.' },
+      ]);
+      const finalName = result.name || contactPrompt.name;
+      const created = await createContact({ dealer_id: DEALER_ID, name: finalName, phone: result.phone || null });
       if (created?.[0]) setContacts((prev) => [...prev, created[0]].sort((a, b) => a.name.localeCompare(b.name)));
+      answerContactPrompt(finalName);
     } catch (err) {
-      // non-fatal — contact linking is a convenience, not a requirement
+      // fall back to just using the typed name if the photo read fails
+      answerContactPrompt(contactPrompt.name);
     }
   };
 
+
+  const applyAddStockFields = (result) => {
+    const { expenses: parsedExpenses, ...phoneFields } = result;
+    setDraft((d) => ({
+      ...d,
+      ...Object.fromEntries(Object.entries(phoneFields).filter(([, v]) => v !== "")),
+      expenses: { ...d.expenses, ...Object.fromEntries(Object.entries(parsedExpenses || {}).filter(([, v]) => v !== "")) },
+    }));
+    setStep("review");
+  };
+
+  // Single entry point for any voice/typed note: Claude first decides whether this
+  // describes a NEW phone to add, or an action (sale/return) on EXISTING stock.
   const parseNote = async (transcript) => {
     setVoiceTranscript(transcript);
     setVoiceStatus("thinking");
     try {
-      const result = await askClaude([
-        { type: "text", text: `A phone dealer said this out loud while logging stock: "${transcript}". Extract whatever's mentioned into JSON. Respond ONLY with raw JSON, no markdown, no other text before or after, in this exact shape: {"model": "", "storage": "", "color": "", "cost_price": "", "price": "", "bought_from": "", "sold_to": "", "condition_score": "", "warranty_months": "", "expenses": {"shipping": "", "repairs": "", "accessories": "", "labour": "", "petrol": "", "sundry": ""}}. All price/cost/expense values should be plain numbers only (no "R", no commas, no currency words), as strings. Leave anything not mentioned as an empty string. If the speaker corrects themselves mid-sentence (e.g. says one value then says "no wait" or "not X, Y"), use their corrected/final value, not the first one they said.` },
-      ]);
-      const { expenses: parsedExpenses, ...phoneFields } = result;
-      setDraft((d) => ({
-        ...d,
-        ...Object.fromEntries(Object.entries(phoneFields).filter(([, v]) => v !== "")),
-        expenses: { ...d.expenses, ...Object.fromEntries(Object.entries(parsedExpenses || {}).filter(([, v]) => v !== "")) },
+      const candidates = items.map((i) => ({
+        id: i.id, model: i.model, storage: i.storage, color: i.color,
+        imei_last4: i.imei_last4, price: i.price, status: i.status,
       }));
-      setStep("review");
+
+      const result = await askClaude([
+        { type: "text", text: `A phone dealer said this out loud: "${transcript}". Their current stock is: ${JSON.stringify(candidates)}.
+
+First decide the mode:
+- "add_new": they are describing a phone they just acquired/are adding to stock (mentions buying it, a cost price, specs of a phone not already in the list)
+- "update": they are describing an action on a phone ALREADY in their stock list above — a sale, a customer return (faulty), or sending a faulty item back to a supplier
+
+Respond ONLY with raw JSON, no markdown, no other text, in exactly one of these two shapes:
+
+If mode is add_new: {"mode": "add_new", "model": "", "storage": "", "color": "", "cost_price": "", "price": "", "bought_from": "", "sold_to": "", "condition_score": "", "warranty_months": "", "expenses": {"shipping": "", "repairs": "", "accessories": "", "labour": "", "petrol": "", "sundry": ""}}
+
+If mode is update: {"mode": "update", "actions": [{"listing_id": "", "action": "sold"|"returned_faulty"|"returned_supplier", "sold_to": "", "paid": false}]}
+
+All price/cost/expense values should be plain numbers only (no "R", no commas), as strings. Leave anything not mentioned as an empty string. If the speaker corrects themselves mid-sentence, use their corrected/final value.` },
+      ]);
+
+      if (result.mode === "update") {
+        const actions = result.actions || [];
+        const matches = actions.map((a) => ({
+          listing: items.find((i) => i.id === a.listing_id) || null,
+          action: a.action || "sold",
+          sold_to: a.sold_to || "",
+          paid: !!a.paid,
+          resolved: false,
+        }));
+        setSaleTranscript(transcript);
+        setSaleMatches(matches.length > 0 ? matches : [{ listing: null, action: "sold", sold_to: "", paid: false, resolved: false }]);
+        setSaleError(matches.length === 0 ? "Couldn't confidently match that — pick manually below." : "");
+        setSaleStep("confirm");
+        setStep("idle");
+      } else {
+        applyAddStockFields(result);
+      }
     } catch (err) {
       setError("Had trouble understanding that (" + err.message + ") — check the fields below.");
       setStep("review");
@@ -236,85 +307,6 @@ export default function StockLedgerLive() {
   const openManual = () => { setDraft(blankDraft); setPhotoPreview(null); setVoiceTranscript(""); setError(""); setStep("review"); };
   const reset = () => { setStep("idle"); setDraft(blankDraft); setPhotoPreview(null); setVoiceTranscript(""); setError(""); };
 
-  // --- Voice-note actions: sales AND returns, possibly several in one recording ---
-  const matchSaleFromTranscript = async (transcript) => {
-    setSaleTranscript(transcript);
-    setSaleStep("matching");
-    try {
-      // Candidates cover every non-archived listing, since a return references something
-      // already sold, not just current available stock.
-      const candidates = items.map((i) => ({
-        id: i.id, model: i.model, storage: i.storage, color: i.color,
-        imei_last4: i.imei_last4, price: i.price, status: i.status,
-      }));
-
-      const result = await askClaude([
-        { type: "text", text: `A phone dealer said this while updating stock: "${transcript}". This may describe ONE or SEVERAL separate actions. Here is their current stock as JSON, including each item's current status: ${JSON.stringify(candidates)}.
-
-For each distinct action mentioned, identify:
-- which listing (by id) it refers to
-- the action type: "sold" (a new sale — item should currently be available/reserved), "returned_faulty" (customer returned it, e.g. currently sold_paid/sold_unpaid and they mention a fault, refund, or return), or "returned_supplier" (sending an already-faulty-returned item back to whoever supplied it)
-- for "sold" actions only: who it was sold to (sold_to) and whether they said it's paid
-
-Respond ONLY with raw JSON, no markdown: {"actions": [{"listing_id": "", "action": "", "sold_to": "", "paid": false}]}. If you cannot confidently match an action to any listing, omit it rather than guessing.` },
-      ]);
-
-      const actions = result.actions || [];
-      const matches = actions.map((a) => ({
-        listing: items.find((i) => i.id === a.listing_id) || null,
-        action: a.action || "sold",
-        sold_to: a.sold_to || "",
-        paid: !!a.paid,
-        resolved: false,
-      }));
-
-      if (matches.length === 0) {
-        setSaleError("Couldn't confidently match that to anything in stock — pick it manually below.");
-        setSaleMatches([{ listing: null, action: "sold", sold_to: "", paid: false, resolved: false }]);
-      } else {
-        setSaleError("");
-        setSaleMatches(matches);
-      }
-      setSaleStep("confirm");
-    } catch (err) {
-      setSaleError("Had trouble matching that (" + err.message + ") — pick manually below.");
-      setSaleMatches([{ listing: null, action: "sold", sold_to: "", paid: false, resolved: false }]);
-      setSaleStep("confirm");
-    }
-  };
-
-  const startSaleVoice = async () => {
-    setSaleError("");
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
-      saleChunksRef.current = [];
-      recorder.ondataavailable = (e) => saleChunksRef.current.push(e.data);
-      recorder.onstop = async () => {
-        stream.getTracks().forEach((t) => t.stop());
-        setSaleStep("matching");
-        try {
-          const audioBlob = new Blob(saleChunksRef.current, { type: "audio/webm" });
-          const formData = new FormData();
-          formData.append("audio", audioBlob, "recording.webm");
-          const res = await fetch("/api/transcribe", { method: "POST", body: formData });
-          const data = await res.json();
-          if (!res.ok || data.error) throw new Error(data.error || "Transcription failed");
-          await matchSaleFromTranscript(data.transcript);
-        } catch (err) {
-          setSaleError("Couldn't transcribe that (" + err.message + ") — try again.");
-          setSaleStep("idle");
-        }
-      };
-      saleRecorderRef.current = recorder;
-      recorder.start();
-      setSaleStep("listening");
-    } catch (err) {
-      setSaleError("Couldn't access the microphone — check permissions.");
-    }
-  };
-  const stopSaleVoice = () => saleRecorderRef.current?.stop();
-
   const ACTION_TO_STATUS = { sold: (paid) => (paid ? "sold_paid" : "sold_unpaid"), returned_faulty: () => "returned_faulty", returned_supplier: () => "returned_supplier" };
   const ACTION_LABEL = { sold: "Mark sold", returned_faulty: "Mark returned — faulty", returned_supplier: "Mark returned to supplier" };
 
@@ -323,9 +315,8 @@ Respond ONLY with raw JSON, no markdown: {"actions": [{"listing_id": "", "action
     if (!m?.listing) return;
     try {
       const updates = { status: ACTION_TO_STATUS[m.action](m.paid) };
-      if (m.action === "sold") updates.sold_to = m.sold_to || null;
+      if (m.action === "sold") updates.sold_to = await resolveContact(m.sold_to);
       await updateListing(m.listing.id, updates);
-      if (m.action === "sold") await ensureContact(m.sold_to);
       await refresh();
       setSaleMatches((prev) => prev.map((x, i) => (i === index ? { ...x, resolved: true } : x)));
     } catch (err) {
@@ -456,6 +447,8 @@ Respond ONLY with raw JSON, no markdown: {"actions": [{"listing_id": "", "action
     setSaving(true);
     setError("");
     try {
+      const resolvedBoughtFrom = await resolveContact(draft.bought_from);
+      const resolvedSoldTo = await resolveContact(draft.sold_to);
       const created = await createListing({
         dealer_id: DEALER_ID,
         model: draft.model,
@@ -463,15 +456,14 @@ Respond ONLY with raw JSON, no markdown: {"actions": [{"listing_id": "", "action
         color: draft.color || null,
         cost_price: draft.cost_price ? Number(draft.cost_price) : null,
         price: Number(draft.price) || 0,
-        bought_from: draft.bought_from || null,
-        sold_to: draft.sold_to || null,
+        bought_from: resolvedBoughtFrom,
+        sold_to: resolvedSoldTo,
         imei_full: draft.imei_full || null,
         condition_score: draft.condition_score ? Number(draft.condition_score) : null,
         warranty_months: draft.warranty_months ? Number(draft.warranty_months) : null,
         stock_type: "pre_owned",
         status: "available",
       });
-      await Promise.all([ensureContact(draft.bought_from), ensureContact(draft.sold_to)]);
       const newListingId = created?.[0]?.id;
       const expenseEntries = Object.entries(draft.expenses || {}).filter(([, v]) => v && Number(v) > 0);
       if (newListingId && expenseEntries.length > 0) {
@@ -505,6 +497,51 @@ Respond ONLY with raw JSON, no markdown: {"actions": [{"listing_id": "", "action
       await archiveListing(id);
     } catch (err) {
       setLoadError("Archive failed to save — refresh to check.");
+    }
+  };
+
+  const startEdit = (item) => {
+    setEditingId(item.id);
+    setEditDraft({
+      model: item.model || "",
+      storage: item.storage || "",
+      color: item.color || "",
+      imei_full: item.imei_full || "",
+      cost_price: item.cost_price ?? "",
+      price: item.price ?? "",
+      bought_from: item.bought_from || "",
+      sold_to: item.sold_to || "",
+      warranty_months: item.warranty_months ?? "",
+      condition_score: item.condition_score ?? "",
+    });
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setEditDraft(null);
+  };
+
+  const saveEdit = async () => {
+    if (!editingId || !editDraft) return;
+    try {
+      const resolvedBoughtFrom = await resolveContact(editDraft.bought_from);
+      const resolvedSoldTo = await resolveContact(editDraft.sold_to);
+      await updateListing(editingId, {
+        model: editDraft.model,
+        storage: editDraft.storage || null,
+        color: editDraft.color || null,
+        imei_full: editDraft.imei_full || null,
+        cost_price: editDraft.cost_price !== "" ? Number(editDraft.cost_price) : null,
+        price: editDraft.price !== "" ? Number(editDraft.price) : 0,
+        bought_from: resolvedBoughtFrom,
+        sold_to: resolvedSoldTo,
+        warranty_months: editDraft.warranty_months !== "" ? Number(editDraft.warranty_months) : null,
+        condition_score: editDraft.condition_score !== "" ? Number(editDraft.condition_score) : null,
+      });
+      await refresh();
+      cancelEdit();
+    } catch (err) {
+      setLoadError("Couldn't save that edit (" + err.message + ") — try again.");
     }
   };
 
@@ -672,6 +709,52 @@ Respond ONLY with raw JSON, no markdown: {"actions": [{"listing_id": "", "action
         </div>
       )}
 
+      {contactPrompt && (
+        <div className="border-2 rounded-sm p-4 mb-4" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
+          <p className="text-sm font-semibold mb-2">Contact: "{contactPrompt.name}"</p>
+
+          {!contactPrompt.showChoices && contactPrompt.similar.length > 0 && (
+            <>
+              <p className="text-sm mb-3">
+                Do you mean <strong>{contactPrompt.similar[0].name}</strong>{contactPrompt.similar[0].phone ? ` (${contactPrompt.similar[0].phone})` : ""}?
+              </p>
+              <div className="flex gap-2">
+                <button onClick={() => answerContactPrompt(contactPrompt.similar[0].name)} className="text-sm font-medium px-4 py-2 rounded-sm text-white flex items-center gap-1.5" style={{ background: "#3A5A5E" }}>
+                  <Check size={14} /> Yes
+                </button>
+                <button onClick={() => setContactPrompt((p) => ({ ...p, showChoices: true }))} className="text-sm font-medium px-4 py-2 rounded-sm border" style={{ borderColor: "#D8D2C2", color: "#6B6555" }}>
+                  No
+                </button>
+              </div>
+            </>
+          )}
+
+          {contactPrompt.showChoices && (
+            <>
+              <p className="text-xs mb-2" style={{ color: "#6B6555" }}>Select an existing contact, or screenshot their details to add them as new:</p>
+              <select
+                onChange={(e) => e.target.value && answerContactPrompt(e.target.value)}
+                className="border px-2.5 py-2 text-sm rounded-sm w-full mb-2"
+                style={{ borderColor: "#D8D2C2" }}
+                defaultValue=""
+              >
+                <option value="" disabled>Select a contact…</option>
+                {contacts.map((c) => (<option key={c.id} value={c.name}>{c.name}{c.phone ? ` · ${c.phone}` : ""}</option>))}
+              </select>
+              <div className="flex gap-2 items-center">
+                <button onClick={() => contactPromptFileInputRef.current?.click()} className="text-sm font-medium px-4 py-2 rounded-sm text-white flex items-center gap-1.5" style={{ background: "#1C1B19" }}>
+                  <Camera size={14} /> Screenshot their details
+                </button>
+                <input ref={contactPromptFileInputRef} type="file" accept="image/*" onChange={handleContactPromptPhoto} className="hidden" />
+                <button onClick={() => answerContactPrompt(contactPrompt.name)} className="text-xs" style={{ color: "#8A8272" }}>
+                  Just use "{contactPrompt.name}" as typed
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
       {loadError && (
         <div className="border rounded-sm p-3 mb-4 text-sm" style={{ borderColor: "#A8452F", background: "#F3E1DC", color: "#A8452F" }}>
           {loadError}
@@ -695,7 +778,7 @@ Respond ONLY with raw JSON, no markdown: {"actions": [{"listing_id": "", "action
 
       {step === "idle" && (
         <div className="border-2 rounded-sm p-5 mb-6 text-center" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
-          <p className="text-xs uppercase tracking-wide mb-4" style={{ color: "#6B6555" }}>Add stock — snap it, say it</p>
+          <p className="text-xs uppercase tracking-wide mb-4" style={{ color: "#6B6555" }}>Add stock, mark a sale, or log a return — snap it, say it</p>
           <div className="flex flex-col sm:flex-row gap-3 justify-center">
             <button onClick={() => fileInputRef.current?.click()} className="flex items-center justify-center gap-2 text-white text-sm font-medium px-5 py-3 rounded-sm hover:opacity-90" style={{ background: "#1C1B19" }}>
               <Camera size={16} /> Photo of box / IMEI
@@ -721,32 +804,6 @@ Respond ONLY with raw JSON, no markdown: {"actions": [{"listing_id": "", "action
               </button>
             </div>
           </div>
-        </div>
-      )}
-
-      {step === "idle" && saleStep === "idle" && (
-        <div className="border-2 rounded-sm p-4 mb-6 text-center" style={{ borderColor: "#D8D2C2", background: "#FBFAF6" }}>
-          <p className="text-xs uppercase tracking-wide mb-3" style={{ color: "#6B6555" }}>Or update existing stock — sales, faulty returns, supplier returns. Say as many as you like in one go.</p>
-          <button onClick={startSaleVoice} className="text-sm font-medium px-5 py-3 rounded-sm text-white hover:opacity-90 flex items-center gap-2 mx-auto" style={{ background: "#A8452F" }}>
-            <Mic size={16} /> "I sold the iPhone 12 to Kyle, and the Samsung came back faulty..."
-          </button>
-          {saleError && <p className="text-xs mt-3" style={{ color: "#A8452F" }}>{saleError}</p>}
-        </div>
-      )}
-
-      {saleStep === "listening" && (
-        <div className="border-2 rounded-sm p-4 mb-6 text-center" style={{ borderColor: "#A8452F", background: "#F3E1DC" }}>
-          <p className="text-sm mb-3 animate-pulse" style={{ color: "#A8452F" }}>Listening… describe any sales or returns</p>
-          <button onClick={stopSaleVoice} className="text-sm font-medium px-5 py-3 rounded-sm text-white" style={{ background: "#A8452F" }}>
-            <Square size={14} className="inline mr-1.5" /> Stop
-          </button>
-        </div>
-      )}
-
-      {saleStep === "matching" && (
-        <div className="border-2 rounded-sm p-4 mb-6 flex items-center gap-3" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
-          <Loader2 size={16} className="animate-spin" style={{ color: "#6B6555" }} />
-          <p className="text-sm" style={{ color: "#6B6555" }}>Matching that against your current stock…</p>
         </div>
       )}
 
@@ -888,6 +945,34 @@ Respond ONLY with raw JSON, no markdown: {"actions": [{"listing_id": "", "action
         {!loading && visible.length === 0 && <p className="text-sm py-8 text-center" style={{ color: "#6B6555" }}>Nothing here yet — add your first phone above.</p>}
         {visible.map((item) => {
           const st = STATUSES.find((s) => s.key === item.status) || STATUSES[0];
+
+          if (editingId === item.id && editDraft) {
+            return (
+              <div key={item.id} className="border-b py-3" style={{ borderColor: "#D8D2C2" }}>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-2">
+                  <input placeholder="Model" value={editDraft.model} onChange={(e) => setEditDraft({ ...editDraft, model: e.target.value })} className="border px-2 py-1.5 text-sm rounded-sm col-span-2 md:col-span-1" style={{ borderColor: "#D8D2C2" }} />
+                  <input placeholder="Storage" value={editDraft.storage} onChange={(e) => setEditDraft({ ...editDraft, storage: e.target.value })} className="border px-2 py-1.5 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
+                  <input placeholder="Color" value={editDraft.color} onChange={(e) => setEditDraft({ ...editDraft, color: e.target.value })} className="border px-2 py-1.5 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
+                  <input placeholder="IMEI" value={editDraft.imei_full} onChange={(e) => setEditDraft({ ...editDraft, imei_full: e.target.value })} className="border px-2 py-1.5 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
+                  <input list="contact-names" placeholder="Bought from" value={editDraft.bought_from} onChange={(e) => setEditDraft({ ...editDraft, bought_from: e.target.value })} className="border px-2 py-1.5 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
+                  <input list="contact-names" placeholder="Sold to" value={editDraft.sold_to} onChange={(e) => setEditDraft({ ...editDraft, sold_to: e.target.value })} className="border px-2 py-1.5 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
+                  <input placeholder="Cost price" type="number" value={editDraft.cost_price} onChange={(e) => setEditDraft({ ...editDraft, cost_price: e.target.value })} className="border px-2 py-1.5 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
+                  <input placeholder="Selling price" type="number" value={editDraft.price} onChange={(e) => setEditDraft({ ...editDraft, price: e.target.value })} className="border px-2 py-1.5 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
+                  <input placeholder="Warranty (months)" type="number" value={editDraft.warranty_months} onChange={(e) => setEditDraft({ ...editDraft, warranty_months: e.target.value })} className="border px-2 py-1.5 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
+                  <input placeholder="Condition /10" type="number" value={editDraft.condition_score} onChange={(e) => setEditDraft({ ...editDraft, condition_score: e.target.value })} className="border px-2 py-1.5 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={saveEdit} className="text-xs font-medium px-3 py-1.5 rounded-sm text-white flex items-center gap-1" style={{ background: "#3A5A5E" }}>
+                    <Check size={12} /> Save changes
+                  </button>
+                  <button onClick={cancelEdit} className="text-xs font-medium px-3 py-1.5 rounded-sm border" style={{ borderColor: "#D8D2C2", color: "#6B6555" }}>
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            );
+          }
+
           return (
             <div key={item.id} className="border-b py-3 flex flex-wrap items-center gap-3 md:gap-4" style={{ borderColor: "#D8D2C2" }}>
               <div className="min-w-[140px] flex-1">
@@ -910,6 +995,7 @@ Respond ONLY with raw JSON, no markdown: {"actions": [{"listing_id": "", "action
                   <Check size={12} /> Mark Paid
                 </button>
               )}
+              <button onClick={() => startEdit(item)} className="p-1.5 hover:opacity-60" style={{ color: "#8A8272" }}><Pencil size={15} /></button>
               <button onClick={() => removeItem(item.id)} className="p-1.5 hover:opacity-60" style={{ color: "#8A8272" }}><X size={15} /></button>
             </div>
           );
