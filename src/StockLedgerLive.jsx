@@ -261,7 +261,7 @@ Respond ONLY with raw JSON, no markdown, no other text, in exactly one of these 
 
 If mode is add_new: {"mode": "add_new", "model": "", "storage": "", "color": "", "cost_price": "", "price": "", "bought_from": "", "sold_to": "", "condition_score": "", "warranty_months": "", "expenses": {"shipping": "", "repairs": "", "accessories": "", "labour": "", "petrol": "", "sundry": ""}}
 
-If mode is update: {"mode": "update", "actions": [{"listing_id": "", "action": "sold"|"returned_faulty"|"returned_supplier"|"adjust", "sold_to": "", "paid": false, "expenses": {"shipping": "", "repairs": "", "accessories": "", "labour": "", "petrol": "", "sundry": "", "credit": ""}}]}. Use action "adjust" specifically when they're logging costs/refunds on an item without a status change — include the expenses object (a supplier refund/credit goes in "credit" as a plain positive number, e.g. 500 for a R500 refund). For "sold"/"returned_faulty"/"returned_supplier" actions, omit expenses unless costs were also mentioned in the same breath.
+If mode is update: {"mode": "update", "actions": [{"listing_id": "", "action": "sold"|"returned_faulty"|"returned_supplier"|"adjust", "sold_to": "", "paid": false, "price": "", "expenses": {"shipping": "", "repairs": "", "accessories": "", "labour": "", "petrol": "", "sundry": "", "credit": ""}}]}. Use action "adjust" specifically when they're logging costs/refunds, or setting/correcting the selling price, on an item without a status change — include the expenses object (a supplier refund/credit goes in "credit" as a plain positive number, e.g. 500 for a R500 refund). Include "price" whenever they state a new or corrected selling price for the item — e.g. "the iPhone 12 is actually R5500" (adjust, no status change), or "sold the Samsung for R3200" where R3200 differs from its currently listed price (sold action, with price set to the actual agreed sale price, since that's what should count for profit). Leave price as an empty string if no selling price was mentioned. For "sold"/"returned_faulty"/"returned_supplier" actions, omit expenses unless costs were also mentioned in the same breath.
 
 All price/cost/expense values should be plain numbers only (no "R", no commas), as strings. Leave anything not mentioned as an empty string. If the speaker corrects themselves mid-sentence, use their corrected/final value.` },
       ]);
@@ -273,11 +273,12 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
           action: a.action || "sold",
           sold_to: a.sold_to || "",
           paid: !!a.paid,
+          price: a.price || "",
           expenses: a.expenses || {},
           resolved: false,
         }));
         setSaleTranscript(transcript);
-        setSaleMatches(matches.length > 0 ? matches : [{ listing: null, action: "sold", sold_to: "", paid: false, resolved: false }]);
+        setSaleMatches(matches.length > 0 ? matches : [{ listing: null, action: "sold", sold_to: "", paid: false, price: "", expenses: {}, resolved: false }]);
         setSaleError(matches.length === 0 ? "Couldn't confidently match that — pick manually below." : "");
         setSaleStep("confirm");
         setStep("idle");
@@ -360,11 +361,15 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
     if (!m?.listing) return;
     try {
       if (m.action === "adjust") {
+        const priceUpdate = m.price !== "" ? { price: Number(m.price) } : {};
+        if (Object.keys(priceUpdate).length > 0) await updateListing(m.listing.id, priceUpdate);
         await saveExpensesForListing(m.listing.id, m.expenses);
       } else {
         const updates = { status: ACTION_TO_STATUS[m.action](m.paid) };
         if (m.action === "sold") updates.sold_to = await resolveContact(m.sold_to);
+        if (m.price !== "") updates.price = Number(m.price);
         await updateListing(m.listing.id, updates);
+        if (m.expenses && Object.keys(m.expenses).length > 0) await saveExpensesForListing(m.listing.id, m.expenses);
       }
       await refresh();
       setSaleMatches((prev) => prev.map((x, i) => (i === index ? { ...x, resolved: true } : x)));
@@ -866,7 +871,18 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
                 <>
                   <p className="text-sm font-semibold">{ACTION_LABEL[m.action]} — is this the phone?</p>
                   <p className="text-sm mt-1">{m.listing.model} {m.listing.storage} · {m.listing.color}</p>
-                  <p className="text-xs mt-0.5 mb-2" style={{ color: "#8A8272" }}>IMEI ···{m.listing.imei_last4 || "—"} · R{Number(m.listing.price).toLocaleString()} · currently {STATUSES.find((s) => s.key === m.listing.status)?.label}</p>
+                  <p className="text-xs mt-0.5 mb-2" style={{ color: "#8A8272" }}>IMEI ···{m.listing.imei_last4 || "—"} · currently listed R{Number(m.listing.price || 0).toLocaleString()} · {STATUSES.find((s) => s.key === m.listing.status)?.label}</p>
+                  <div className="mb-2">
+                    <label className="text-xs" style={{ color: "#6B6555" }}>Selling price {m.action === "sold" ? "(actual sale price)" : ""}</label>
+                    <input
+                      type="number"
+                      placeholder={`R${m.listing.price || 0} (leave blank to keep)`}
+                      value={m.price}
+                      onChange={(e) => setSaleMatches((prev) => prev.map((x, i) => (i === idx ? { ...x, price: e.target.value } : x)))}
+                      className="border px-2.5 py-2 text-sm rounded-sm w-full mt-1"
+                      style={{ borderColor: "#D8D2C2" }}
+                    />
+                  </div>
                   {m.action === "sold" && (
                     <div className="grid grid-cols-2 gap-2.5 mb-2">
                       <input list="contact-names" placeholder="Sold to" value={m.sold_to} onChange={(e) => setSaleMatches((prev) => prev.map((x, i) => (i === idx ? { ...x, sold_to: e.target.value } : x)))} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
