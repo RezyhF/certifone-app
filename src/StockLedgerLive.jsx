@@ -22,6 +22,7 @@ const EXPENSE_CATEGORIES = [
   { key: "labour", label: "Labour" },
   { key: "petrol", label: "Petrol / Courier" },
   { key: "sundry", label: "Sundry / Other" },
+  { key: "credit", label: "Supplier credit / refund" },
 ];
 
 const blankDraft = { model: "", storage: "", color: "", cost_price: "", price: "", warranty_months: "", bought_from: "", sold_to: "", imei_full: "", condition_score: "", expenses: {} };
@@ -49,6 +50,24 @@ async function sbFetch(path, options = {}) {
 const getListings = () => sbFetch("listings?is_archived=eq.false&select=*,expenses(category,amount)&order=created_at.desc");
 const createListing = (data) => sbFetch("listings", { method: "POST", body: JSON.stringify(data) });
 const createExpense = (data) => sbFetch("expenses", { method: "POST", body: JSON.stringify(data) });
+
+// "credit" is stored as a negative amount so it increases profit rather than reducing it,
+// even though the dealer just types/says a plain positive number like "500".
+async function saveExpensesForListing(listingId, expensesObj) {
+  const entries = Object.entries(expensesObj || {}).filter(([, v]) => v && Number(v) > 0);
+  if (entries.length === 0) return;
+  await Promise.all(
+    entries.map(([category, amount]) =>
+      createExpense({
+        dealer_id: DEALER_ID,
+        listing_id: listingId,
+        category,
+        amount: category === "credit" ? -Number(amount) : Number(amount),
+      })
+    )
+  );
+}
+
 const getContacts = () => sbFetch("contacts?order=name.asc");
 const createContact = (data) => sbFetch("contacts", { method: "POST", body: JSON.stringify(data) });
 const updateListingStatus = (id, status) =>
@@ -103,6 +122,7 @@ export default function StockLedgerLive() {
   const [editingId, setEditingId] = useState(null);
   const [editDraft, setEditDraft] = useState(null);
   const [contactPrompt, setContactPrompt] = useState(null); // { name, similar, showChoices }
+  const contactPromptRef = useRef(null);
   const contactResolveRef = useRef(null);
   const contactPromptFileInputRef = useRef(null);
   const [saleStep, setSaleStep] = useState("idle"); // idle, listening, matching, confirm
@@ -142,6 +162,12 @@ export default function StockLedgerLive() {
     refresh();
     getContacts().then(setContacts).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (contactPrompt && contactPromptRef.current) {
+      contactPromptRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [contactPrompt]);
 
   // Ensures a "bought from" / "sold to" name exists as a contact, creating it if new.
   // Returns silently on failure so contact-linking never blocks a save.
@@ -201,23 +227,27 @@ export default function StockLedgerLive() {
     setVoiceTranscript(transcript);
     setVoiceStatus("thinking");
     try {
-      const candidates = items.map((i) => ({
-        id: i.id, model: i.model, storage: i.storage, color: i.color,
-        imei_last4: i.imei_last4, price: i.price, status: i.status,
-      }));
+      // Only send the most recently active items to Claude — keeps requests fast
+      // even once your full stock history grows into the hundreds.
+      const candidates = items
+        .slice(0, 60)
+        .map((i) => ({
+          id: i.id, model: i.model, storage: i.storage, color: i.color,
+          imei_last4: i.imei_last4, price: i.price, status: i.status,
+        }));
 
       const result = await askClaude([
         { type: "text", text: `A phone dealer said this out loud: "${transcript}". Their current stock is: ${JSON.stringify(candidates)}.
 
 First decide the mode:
 - "add_new": they are describing a phone they just acquired/are adding to stock (mentions buying it, a cost price, specs of a phone not already in the list)
-- "update": they are describing an action on a phone ALREADY in their stock list above — a sale, a customer return (faulty), or sending a faulty item back to a supplier
+- "update": they are describing an action on a phone ALREADY in their stock list above — a sale, a customer return (faulty), sending a faulty item back to a supplier, OR logging expenses/repairs/a supplier credit on an existing item without it changing hands (e.g. "the supplier refunded me R500 and I paid R190 for a new battery" — this stays in stock, nothing about status changes)
 
 Respond ONLY with raw JSON, no markdown, no other text, in exactly one of these two shapes:
 
 If mode is add_new: {"mode": "add_new", "model": "", "storage": "", "color": "", "cost_price": "", "price": "", "bought_from": "", "sold_to": "", "condition_score": "", "warranty_months": "", "expenses": {"shipping": "", "repairs": "", "accessories": "", "labour": "", "petrol": "", "sundry": ""}}
 
-If mode is update: {"mode": "update", "actions": [{"listing_id": "", "action": "sold"|"returned_faulty"|"returned_supplier", "sold_to": "", "paid": false}]}
+If mode is update: {"mode": "update", "actions": [{"listing_id": "", "action": "sold"|"returned_faulty"|"returned_supplier"|"adjust", "sold_to": "", "paid": false, "expenses": {"shipping": "", "repairs": "", "accessories": "", "labour": "", "petrol": "", "sundry": "", "credit": ""}}]}. Use action "adjust" specifically when they're logging costs/refunds on an item without a status change — include the expenses object (a supplier refund/credit goes in "credit" as a plain positive number, e.g. 500 for a R500 refund). For "sold"/"returned_faulty"/"returned_supplier" actions, omit expenses unless costs were also mentioned in the same breath.
 
 All price/cost/expense values should be plain numbers only (no "R", no commas), as strings. Leave anything not mentioned as an empty string. If the speaker corrects themselves mid-sentence, use their corrected/final value.` },
       ]);
@@ -229,6 +259,7 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
           action: a.action || "sold",
           sold_to: a.sold_to || "",
           paid: !!a.paid,
+          expenses: a.expenses || {},
           resolved: false,
         }));
         setSaleTranscript(transcript);
@@ -308,15 +339,19 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
   const reset = () => { setStep("idle"); setDraft(blankDraft); setPhotoPreview(null); setVoiceTranscript(""); setError(""); };
 
   const ACTION_TO_STATUS = { sold: (paid) => (paid ? "sold_paid" : "sold_unpaid"), returned_faulty: () => "returned_faulty", returned_supplier: () => "returned_supplier" };
-  const ACTION_LABEL = { sold: "Mark sold", returned_faulty: "Mark returned — faulty", returned_supplier: "Mark returned to supplier" };
+  const ACTION_LABEL = { sold: "Mark sold", returned_faulty: "Mark returned — faulty", returned_supplier: "Mark returned to supplier", adjust: "Log expenses / credit" };
 
   const confirmSaleAt = async (index) => {
     const m = saleMatches[index];
     if (!m?.listing) return;
     try {
-      const updates = { status: ACTION_TO_STATUS[m.action](m.paid) };
-      if (m.action === "sold") updates.sold_to = await resolveContact(m.sold_to);
-      await updateListing(m.listing.id, updates);
+      if (m.action === "adjust") {
+        await saveExpensesForListing(m.listing.id, m.expenses);
+      } else {
+        const updates = { status: ACTION_TO_STATUS[m.action](m.paid) };
+        if (m.action === "sold") updates.sold_to = await resolveContact(m.sold_to);
+        await updateListing(m.listing.id, updates);
+      }
       await refresh();
       setSaleMatches((prev) => prev.map((x, i) => (i === index ? { ...x, resolved: true } : x)));
     } catch (err) {
@@ -465,14 +500,7 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
         status: "available",
       });
       const newListingId = created?.[0]?.id;
-      const expenseEntries = Object.entries(draft.expenses || {}).filter(([, v]) => v && Number(v) > 0);
-      if (newListingId && expenseEntries.length > 0) {
-        await Promise.all(
-          expenseEntries.map(([category, amount]) =>
-            createExpense({ dealer_id: DEALER_ID, listing_id: newListingId, category, amount: Number(amount) })
-          )
-        );
-      }
+      if (newListingId) await saveExpensesForListing(newListingId, draft.expenses);
       await refresh();
       reset();
     } catch (err) {
@@ -710,7 +738,7 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
       )}
 
       {contactPrompt && (
-        <div className="border-2 rounded-sm p-4 mb-4" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
+        <div ref={contactPromptRef} className="border-2 rounded-sm p-4 mb-4" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
           <p className="text-sm font-semibold mb-2">Contact: "{contactPrompt.name}"</p>
 
           {!contactPrompt.showChoices && contactPrompt.similar.length > 0 && (
@@ -829,6 +857,23 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
                         <option value="unpaid">Not paid yet</option>
                         <option value="paid">Paid</option>
                       </select>
+                    </div>
+                  )}
+                  {m.action === "adjust" && (
+                    <div className="grid grid-cols-2 gap-2 mb-2">
+                      {EXPENSE_CATEGORIES.map((cat) => (
+                        <div key={cat.key} className="flex items-center gap-2">
+                          <label className="text-xs w-28 flex-shrink-0" style={{ color: "#6B6555" }}>{cat.label}</label>
+                          <input
+                            type="number"
+                            placeholder="R0"
+                            value={m.expenses?.[cat.key] || ""}
+                            onChange={(e) => setSaleMatches((prev) => prev.map((x, i) => (i === idx ? { ...x, expenses: { ...x.expenses, [cat.key]: e.target.value } } : x)))}
+                            className="border px-2 py-1.5 text-sm rounded-sm flex-1"
+                            style={{ borderColor: "#D8D2C2" }}
+                          />
+                        </div>
+                      ))}
                     </div>
                   )}
                   <div className="flex gap-2">
