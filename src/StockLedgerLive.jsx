@@ -123,6 +123,8 @@ export default function StockLedgerLive() {
   const [editDraft, setEditDraft] = useState(null);
   const [contactPrompt, setContactPrompt] = useState(null); // { name, similar, showChoices }
   const contactPromptRef = useRef(null);
+  const contactsPanelRef = useRef(null);
+  const importPanelRef = useRef(null);
   const contactResolveRef = useRef(null);
   const contactPromptFileInputRef = useRef(null);
   const [saleStep, setSaleStep] = useState("idle"); // idle, listening, matching, confirm
@@ -168,6 +170,18 @@ export default function StockLedgerLive() {
       contactPromptRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
     }
   }, [contactPrompt]);
+
+  useEffect(() => {
+    if (showContacts && contactsPanelRef.current) {
+      contactsPanelRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, [showContacts]);
+
+  useEffect(() => {
+    if (showImport && importPanelRef.current) {
+      importPanelRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, [showImport]);
 
   // Ensures a "bought from" / "sold to" name exists as a contact, creating it if new.
   // Returns silently on failure so contact-linking never blocks a save.
@@ -594,8 +608,76 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
         </div>
       </div>
 
+
+      {contactPrompt && (
+        <div ref={contactPromptRef} className="border-2 rounded-sm p-4 mb-4" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
+          <p className="text-sm font-semibold mb-2">Contact: "{contactPrompt.name}"</p>
+
+          {!contactPrompt.showChoices && contactPrompt.similar.length > 0 && (
+            <>
+              <p className="text-sm mb-3">
+                Do you mean <strong>{contactPrompt.similar[0].name}</strong>{contactPrompt.similar[0].phone ? ` (${contactPrompt.similar[0].phone})` : ""}?
+              </p>
+              <div className="flex gap-2">
+                <button onClick={() => answerContactPrompt(contactPrompt.similar[0].name)} className="text-sm font-medium px-4 py-2 rounded-sm text-white flex items-center gap-1.5" style={{ background: "#3A5A5E" }}>
+                  <Check size={14} /> Yes
+                </button>
+                <button onClick={() => setContactPrompt((p) => ({ ...p, showChoices: true }))} className="text-sm font-medium px-4 py-2 rounded-sm border" style={{ borderColor: "#D8D2C2", color: "#6B6555" }}>
+                  No
+                </button>
+              </div>
+            </>
+          )}
+
+          {contactPrompt.showChoices && (
+            <>
+              <p className="text-xs mb-2" style={{ color: "#6B6555" }}>Select an existing contact, or screenshot their details to add them as new:</p>
+              <select
+                onChange={(e) => e.target.value && answerContactPrompt(e.target.value)}
+                className="border px-2.5 py-2 text-sm rounded-sm w-full mb-2"
+                style={{ borderColor: "#D8D2C2" }}
+                defaultValue=""
+              >
+                <option value="" disabled>Select a contact…</option>
+                {contacts.map((c) => (<option key={c.id} value={c.name}>{c.name}{c.phone ? ` · ${c.phone}` : ""}</option>))}
+              </select>
+              <div className="flex gap-2 items-center">
+                <button onClick={() => contactPromptFileInputRef.current?.click()} className="text-sm font-medium px-4 py-2 rounded-sm text-white flex items-center gap-1.5" style={{ background: "#1C1B19" }}>
+                  <Camera size={14} /> Screenshot their details
+                </button>
+                <input ref={contactPromptFileInputRef} type="file" accept="image/*" onChange={handleContactPromptPhoto} className="hidden" />
+                <button onClick={() => answerContactPrompt(contactPrompt.name)} className="text-xs" style={{ color: "#8A8272" }}>
+                  Just use "{contactPrompt.name}" as typed
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {loadError && (
+        <div className="border rounded-sm p-3 mb-4 text-sm" style={{ borderColor: "#A8452F", background: "#F3E1DC", color: "#A8452F" }}>
+          {loadError}
+        </div>
+      )}
+
+      <div className="grid grid-cols-3 gap-3 mb-6">
+        <div className="border rounded-sm p-3 md:p-4" style={{ borderColor: "#D8D2C2", background: "#FBFAF6" }}>
+          <div className="flex items-center gap-1.5 text-xs mb-1" style={{ color: "#6B6555" }}><Package size={13} /> In stock</div>
+          <div style={{ fontFamily: "'Roboto Slab', serif" }} className="text-xl md:text-2xl font-bold">{loading ? "…" : totalStock}</div>
+        </div>
+        <div className="border rounded-sm p-3 md:p-4" style={{ borderColor: "#D8D2C2", background: "#FBFAF6" }}>
+          <div className="flex items-center gap-1.5 text-xs mb-1" style={{ color: "#6B6555" }}><TrendingUp size={13} /> Gross profit (paid)</div>
+          <div style={{ fontFamily: "'Roboto Slab', serif", color: "#3A5A5E" }} className="text-xl md:text-2xl font-bold">{loading ? "…" : `R${grossProfit.toLocaleString()}`}</div>
+        </div>
+        <div className="border rounded-sm p-3 md:p-4" style={{ borderColor: "#D8D2C2", background: "#FBFAF6" }}>
+          <div className="flex items-center gap-1.5 text-xs mb-1" style={{ color: "#6B6555" }}><Smartphone size={13} /> Live on marketplace</div>
+          <div style={{ fontFamily: "'Roboto Slab', serif" }} className="text-xl md:text-2xl font-bold">{loading ? "…" : publicCount}</div>
+        </div>
+      </div>
+
       {showContacts && (
-        <div className="border-2 rounded-sm p-4 mb-6" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
+        <div ref={contactsPanelRef} className="border-2 rounded-sm p-4 mb-6" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
           <p className="text-xs uppercase tracking-wide mb-3" style={{ color: "#6B6555" }}>Contacts (buyers & suppliers)</p>
 
           {contactCaptureStep === "idle" && (
@@ -606,6 +688,9 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
               <input ref={contactFileInputRef} type="file" accept="image/*" onChange={handleContactPhoto} className="hidden" />
               <button onClick={startContactVoice} className="flex items-center justify-center gap-1.5 text-xs font-medium px-3 py-2 rounded-sm text-white" style={{ background: "#3A5A5E" }}>
                 <Mic size={13} /> Voice note their location
+              </button>
+              <button onClick={() => { setContactDraft({ name: "", phone: "", location: "" }); setSimilarContacts([]); setContactCaptureError(""); setContactPhotoPreview(null); setContactCaptureStep("review"); }} className="flex items-center justify-center gap-1.5 text-xs font-medium px-3 py-2 rounded-sm border" style={{ borderColor: "#D8D2C2", color: "#6B6555" }}>
+                Type manually
               </button>
             </div>
           )}
@@ -692,7 +777,7 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
       )}
 
       {showImport && (
-        <div className="border-2 rounded-sm p-4 mb-6" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
+        <div ref={importPanelRef} className="border-2 rounded-sm p-4 mb-6" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
           <p className="text-xs uppercase tracking-wide mb-2" style={{ color: "#6B6555" }}>Bulk import existing stock</p>
           <p className="text-xs mb-3" style={{ color: "#8A8272" }}>
             CSV columns (header row required): model, storage, color, cost_price, price, bought_from, imei_full, warranty_months
@@ -736,74 +821,6 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
           {importStatus && <p className="text-xs mt-2" style={{ color: "#3A5A5E" }}>{importStatus}</p>}
         </div>
       )}
-
-      {contactPrompt && (
-        <div ref={contactPromptRef} className="border-2 rounded-sm p-4 mb-4" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
-          <p className="text-sm font-semibold mb-2">Contact: "{contactPrompt.name}"</p>
-
-          {!contactPrompt.showChoices && contactPrompt.similar.length > 0 && (
-            <>
-              <p className="text-sm mb-3">
-                Do you mean <strong>{contactPrompt.similar[0].name}</strong>{contactPrompt.similar[0].phone ? ` (${contactPrompt.similar[0].phone})` : ""}?
-              </p>
-              <div className="flex gap-2">
-                <button onClick={() => answerContactPrompt(contactPrompt.similar[0].name)} className="text-sm font-medium px-4 py-2 rounded-sm text-white flex items-center gap-1.5" style={{ background: "#3A5A5E" }}>
-                  <Check size={14} /> Yes
-                </button>
-                <button onClick={() => setContactPrompt((p) => ({ ...p, showChoices: true }))} className="text-sm font-medium px-4 py-2 rounded-sm border" style={{ borderColor: "#D8D2C2", color: "#6B6555" }}>
-                  No
-                </button>
-              </div>
-            </>
-          )}
-
-          {contactPrompt.showChoices && (
-            <>
-              <p className="text-xs mb-2" style={{ color: "#6B6555" }}>Select an existing contact, or screenshot their details to add them as new:</p>
-              <select
-                onChange={(e) => e.target.value && answerContactPrompt(e.target.value)}
-                className="border px-2.5 py-2 text-sm rounded-sm w-full mb-2"
-                style={{ borderColor: "#D8D2C2" }}
-                defaultValue=""
-              >
-                <option value="" disabled>Select a contact…</option>
-                {contacts.map((c) => (<option key={c.id} value={c.name}>{c.name}{c.phone ? ` · ${c.phone}` : ""}</option>))}
-              </select>
-              <div className="flex gap-2 items-center">
-                <button onClick={() => contactPromptFileInputRef.current?.click()} className="text-sm font-medium px-4 py-2 rounded-sm text-white flex items-center gap-1.5" style={{ background: "#1C1B19" }}>
-                  <Camera size={14} /> Screenshot their details
-                </button>
-                <input ref={contactPromptFileInputRef} type="file" accept="image/*" onChange={handleContactPromptPhoto} className="hidden" />
-                <button onClick={() => answerContactPrompt(contactPrompt.name)} className="text-xs" style={{ color: "#8A8272" }}>
-                  Just use "{contactPrompt.name}" as typed
-                </button>
-              </div>
-            </>
-          )}
-        </div>
-      )}
-
-      {loadError && (
-        <div className="border rounded-sm p-3 mb-4 text-sm" style={{ borderColor: "#A8452F", background: "#F3E1DC", color: "#A8452F" }}>
-          {loadError}
-        </div>
-      )}
-
-      <div className="grid grid-cols-3 gap-3 mb-6">
-        <div className="border rounded-sm p-3 md:p-4" style={{ borderColor: "#D8D2C2", background: "#FBFAF6" }}>
-          <div className="flex items-center gap-1.5 text-xs mb-1" style={{ color: "#6B6555" }}><Package size={13} /> In stock</div>
-          <div style={{ fontFamily: "'Roboto Slab', serif" }} className="text-xl md:text-2xl font-bold">{loading ? "…" : totalStock}</div>
-        </div>
-        <div className="border rounded-sm p-3 md:p-4" style={{ borderColor: "#D8D2C2", background: "#FBFAF6" }}>
-          <div className="flex items-center gap-1.5 text-xs mb-1" style={{ color: "#6B6555" }}><TrendingUp size={13} /> Gross profit (paid)</div>
-          <div style={{ fontFamily: "'Roboto Slab', serif", color: "#3A5A5E" }} className="text-xl md:text-2xl font-bold">{loading ? "…" : `R${grossProfit.toLocaleString()}`}</div>
-        </div>
-        <div className="border rounded-sm p-3 md:p-4" style={{ borderColor: "#D8D2C2", background: "#FBFAF6" }}>
-          <div className="flex items-center gap-1.5 text-xs mb-1" style={{ color: "#6B6555" }}><Smartphone size={13} /> Live on marketplace</div>
-          <div style={{ fontFamily: "'Roboto Slab', serif" }} className="text-xl md:text-2xl font-bold">{loading ? "…" : publicCount}</div>
-        </div>
-      </div>
-
       {step === "idle" && (
         <div className="border-2 rounded-sm p-5 mb-6 text-center" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
           <p className="text-xs uppercase tracking-wide mb-4" style={{ color: "#6B6555" }}>Add stock, mark a sale, or log a return — snap it, say it</p>
