@@ -25,7 +25,7 @@ const EXPENSE_CATEGORIES = [
   { key: "credit", label: "Supplier credit / refund" },
 ];
 
-const blankDraft = { model: "", storage: "", color: "", cost_price: "", price: "", warranty_months: "", bought_from: "", sold_to: "", imei_full: "", condition_score: "", expenses: {} };
+const blankDraft = { model: "", storage: "", color: "", cost_price: "", price: "", warranty_months: "", bought_from: "", sold_to: "", imei_full: "", condition_score: "", available_date: "", expenses: {} };
 
 // --- Supabase REST helpers (direct fetch, no client library needed) ---
 async function sbFetch(path, options = {}) {
@@ -122,6 +122,9 @@ export default function StockLedgerLive() {
   const [editingId, setEditingId] = useState(null);
   const [editDraft, setEditDraft] = useState(null);
   const [contactPrompt, setContactPrompt] = useState(null); // { name, similar, showChoices }
+  const [imeiPrompt, setImeiPrompt] = useState(null); // { imei, priorListing }
+  const imeiResolveRef = useRef(null);
+  const imeiPromptRef = useRef(null);
   const contactPromptRef = useRef(null);
   const contactsPanelRef = useRef(null);
   const importPanelRef = useRef(null);
@@ -172,6 +175,12 @@ export default function StockLedgerLive() {
   }, [contactPrompt]);
 
   useEffect(() => {
+    if (imeiPrompt && imeiPromptRef.current) {
+      imeiPromptRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [imeiPrompt]);
+
+  useEffect(() => {
     if (showContacts && contactsPanelRef.current) {
       contactsPanelRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
     }
@@ -198,6 +207,27 @@ export default function StockLedgerLive() {
       setContactPrompt({ name: trimmed, similar, showChoices: similar.length === 0 });
     });
   };
+
+  // Flags when a new/edited listing's IMEI matches one already on record — never blocks,
+  // just asks for an explanation (trade-in, buyback, return, etc.) so nothing is a silent
+  // unexplained re-listing of the same device.
+  const checkImeiReuse = (imei, excludeListingId) => {
+    return new Promise((resolve) => {
+      if (!imei || !imei.trim()) return resolve(null);
+      const trimmed = imei.trim();
+      const priorListing = items.find((i) => i.imei_full && i.imei_full.trim() === trimmed && i.id !== excludeListingId);
+      if (!priorListing) return resolve(null);
+      imeiResolveRef.current = resolve;
+      setImeiPrompt({ imei: trimmed, priorListing });
+    });
+  };
+
+  const answerImeiPrompt = (reason) => {
+    imeiResolveRef.current?.(reason);
+    imeiResolveRef.current = null;
+    setImeiPrompt(null);
+  };
+
 
   const answerContactPrompt = (finalName) => {
     contactResolveRef.current?.(finalName);
@@ -498,9 +528,14 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
 
   const saveDraft = async () => {
     if (!draft.model) return;
+    if (!draft.imei_full && !draft.available_date) {
+      setError("No IMEI on this one — set when it'll actually be available before saving.");
+      return;
+    }
     setSaving(true);
     setError("");
     try {
+      const relistingReason = await checkImeiReuse(draft.imei_full, null);
       const resolvedBoughtFrom = await resolveContact(draft.bought_from);
       const resolvedSoldTo = await resolveContact(draft.sold_to);
       const created = await createListing({
@@ -513,6 +548,8 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
         bought_from: resolvedBoughtFrom,
         sold_to: resolvedSoldTo,
         imei_full: draft.imei_full || null,
+        available_date: draft.available_date || null,
+        relisting_reason: relistingReason || null,
         condition_score: draft.condition_score ? Number(draft.condition_score) : null,
         warranty_months: draft.warranty_months ? Number(draft.warranty_months) : null,
         stock_type: "pre_owned",
@@ -571,6 +608,7 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
   const saveEdit = async () => {
     if (!editingId || !editDraft) return;
     try {
+      const relistingReason = await checkImeiReuse(editDraft.imei_full, editingId);
       const resolvedBoughtFrom = await resolveContact(editDraft.bought_from);
       const resolvedSoldTo = await resolveContact(editDraft.sold_to);
       await updateListing(editingId, {
@@ -578,6 +616,7 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
         storage: editDraft.storage || null,
         color: editDraft.color || null,
         imei_full: editDraft.imei_full || null,
+        relisting_reason: relistingReason || undefined,
         cost_price: editDraft.cost_price !== "" ? Number(editDraft.cost_price) : null,
         price: editDraft.price !== "" ? Number(editDraft.price) : 0,
         bought_from: resolvedBoughtFrom,
@@ -613,6 +652,23 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
         </div>
       </div>
 
+
+      {imeiPrompt && (
+        <div ref={imeiPromptRef} className="border-2 rounded-sm p-4 mb-4" style={{ borderColor: "#A8452F", background: "#F3E1DC" }}>
+          <p className="text-sm font-semibold mb-2" style={{ color: "#A8452F" }}>This IMEI is already on record</p>
+          <p className="text-sm mb-3">
+            ···{imeiPrompt.imei.slice(-4)} was previously listed as <strong>{imeiPrompt.priorListing.model} {imeiPrompt.priorListing.storage}</strong>, currently marked <strong>{STATUSES.find((s) => s.key === imeiPrompt.priorListing.status)?.label}</strong>.
+          </p>
+          <p className="text-xs mb-2" style={{ color: "#6B6555" }}>What's the reason for the same IMEI appearing again? (not blocked — just kept on record)</p>
+          <div className="flex flex-col gap-2">
+            {["Trade-in from a customer", "Bought back from the buyer", "Returned by the buyer", "Other / not sure"].map((reason) => (
+              <button key={reason} onClick={() => answerImeiPrompt(reason)} className="text-sm text-left px-3 py-2 rounded-sm border hover:opacity-80" style={{ borderColor: "#D8D2C2", background: "#FBFAF6" }}>
+                {reason}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {contactPrompt && (
         <div ref={contactPromptRef} className="border-2 rounded-sm p-4 mb-4" style={{ borderColor: "#1C1B19", background: "#FBFAF6" }}>
@@ -975,6 +1031,19 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
             <input placeholder="Storage" value={draft.storage} onChange={(e) => setDraft({ ...draft, storage: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
             <input placeholder="Color" value={draft.color} onChange={(e) => setDraft({ ...draft, color: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
             <input placeholder="IMEI" value={draft.imei_full} onChange={(e) => setDraft({ ...draft, imei_full: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
+            {!draft.imei_full && (
+              <div className="col-span-2 md:col-span-4">
+                <label className="text-xs" style={{ color: "#A8452F" }}>No IMEI yet — not physically in hand. When can you actually get it to a buyer?</label>
+                <input
+                  type="date"
+                  value={draft.available_date}
+                  onChange={(e) => setDraft({ ...draft, available_date: e.target.value })}
+                  min={new Date().toISOString().split("T")[0]}
+                  className="border px-2.5 py-2 text-sm rounded-sm w-full mt-1"
+                  style={{ borderColor: "#A8452F" }}
+                />
+              </div>
+            )}
             <input list="contact-names" placeholder="Bought from" value={draft.bought_from} onChange={(e) => setDraft({ ...draft, bought_from: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
             <input list="contact-names" placeholder="Sold to (once sold)" value={draft.sold_to} onChange={(e) => setDraft({ ...draft, sold_to: e.target.value })} className="border px-2.5 py-2 text-sm rounded-sm" style={{ borderColor: "#D8D2C2" }} />
             <datalist id="contact-names">
@@ -1059,6 +1128,11 @@ All price/cost/expense values should be plain numbers only (no "R", no commas), 
                   IMEI ···{item.imei_last4 || "—"} · from {item.bought_from || "—"}
                   {expensesTotal(item) > 0 && <> · expenses R{expensesTotal(item).toLocaleString()}</>}
                 </div>
+                {item.available_date && new Date(item.available_date) >= new Date(new Date().toDateString()) && (
+                  <div className="text-xs mt-0.5 font-medium" style={{ color: "#A8452F" }}>
+                    Not in hand — available from {new Date(item.available_date).toLocaleDateString()}
+                  </div>
+                )}
               </div>
               <div style={{ fontFamily: "'Roboto Slab', serif" }} className="text-sm font-bold w-20 text-right">R{Number(item.price || 0).toLocaleString()}</div>
               <select value={item.status} onChange={(e) => setStatus(item.id, e.target.value)} className="text-xs px-2.5 py-1.5 rounded-sm border-none font-medium cursor-pointer" style={{ background: st.bg, color: st.dot }}>
